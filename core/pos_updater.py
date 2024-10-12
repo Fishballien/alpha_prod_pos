@@ -28,6 +28,7 @@ from core.database_handler import FactorReader, ModelPredictReader, PositionSend
 from core.task_scheduler import TaskScheduler
 from core.cache_persist_manager import CacheManager, PersistManager
 from core.optimize_weight import future_optimal_weight_lp_cvxpy
+from core.signal_sender import StrategySignalSender
 from utility.dirutils import load_path_config
 from utility.logutils import FishStyleLogger
 from utility.market import usd, load_binance_data
@@ -59,6 +60,7 @@ class PosUpdater:
         self._init_db_module()
         self._init_cache()
         self._init_persist()
+        self._init_signal_sender()
         self._add_tasks()
         self._set_up_signal_handler()
         
@@ -163,6 +165,11 @@ class PosUpdater:
         persist_list = ['alpha', 'pos_his', 'twap_profit']
         self.persist_mgr = PersistManager(self.persist_dir, persist_list=persist_list, log=self.log)
         
+    def _init_signal_sender(self):
+        zmq_address = self.params['zmq']['address']
+        
+        self.signal_sender = StrategySignalSender(zmq_address)
+        
     def _add_tasks(self):
         pos_update_interval = self.params['pos_update_interval']
         
@@ -193,6 +200,7 @@ class PosUpdater:
         
     def stop(self):
         self.task_scheduler.stop()
+        self.signal_sender.close()
         
     def reload_exchange_info(self, ts):
         exchange_info = load_binance_data(self.exchange, self.exchange_info_dir)
@@ -220,11 +228,11 @@ class PosUpdater:
                 his_pft_t = self._get_his_profit_at_t(ts)
                 w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t)
                 new_pos = self._update_positions_on_universal_set(w0, w1)
-                # TODO: send zmq
+                self._send_pos_to_zmq(new_pos)
                 self._send_pos_to_db(new_pos)
                 pft_till_t = self._calc_profit_t_1_till_t(ts)
                 # self._report_new_pos(new_pos)
-                self._report_pos_diff(new_pos, w0)
+                self._report_pos_diff_and_pnl(new_pos, w0, pft_till_t)
                 self._save_to_cache(ts, new_pos, pft_till_t)
                 self._save_to_persist(ts, alpha, new_pos, pft_till_t)
         except:
@@ -281,8 +289,8 @@ class PosUpdater:
         if allow_init_pre_pos:
             fetch_params['max_attempts'] = 1
             
-        w0 =  fetch_n_check(fetch_n_return_once_func, fetch_target_name='pre_pos',
-                            log=self.log, repo=self.ding, **fetch_params)
+        w0 = fetch_n_check(fetch_n_return_once_func, fetch_target_name='pre_pos',
+                           log=self.log, repo=self.ding, **fetch_params)
         if w0 is None:
             if allow_init_pre_pos:
                 w0 = pd.Series(data=[0]*(len(self.trading_symbols)), index=self.trading_symbols)
@@ -384,6 +392,16 @@ class PosUpdater:
         new_pos = pd.concat([w1, missing_position]) # TODO: to cache & persist
         
         return new_pos
+    
+    def _send_pos_to_zmq(self, new_pos):
+        zmq_params = self.params['zmq']
+        strategy_name = zmq_params['strategy_name']
+        exchange = zmq_params['exchange']
+        symbol_type = zmq_params['symbol_type']
+        
+        for symbol, pos in new_pos.items():
+            symbol_upper = symbol.upper()  # 转为大写
+            self.signal_sender.send_message(strategy_name, exchange, symbol_type, symbol_upper, str(pos))
 
     def _send_pos_to_db(self, new_pos):
         self.pos_sender.insert(new_pos)
@@ -435,16 +453,22 @@ class PosUpdater:
         pos_in_markdown = df_to_markdown(pos_to_repo, show_all=True, columns=['symbol', 'pos'])
         self.ding.send_markdown('SUCCESSFULLY SEND POSITION', pos_in_markdown, msg_type='success')
         
-    def _report_pos_diff(self, new_pos, w0):
+    def _report_pos_diff_and_pnl(self, new_pos, w0, pft_till_t):
         pos_change_to_repo = self.params['pos_change_to_repo']
         
+        ## pos diff
         reindexed_w0 = w0.reindex(new_pos.index)
         pos_diff = new_pos - reindexed_w0
         pos_diff = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
         pos_diff_to_repo = np.round(pos_diff, decimals=4)
         pos_diff_in_markdown = df_to_markdown(pos_diff_to_repo, show_all=True, columns=['symbol', 'pos_diff'])
         hsr = pos_diff.abs().sum() / 2
-        self.ding.send_markdown(f'HSR: {hsr:.2%}', pos_diff_in_markdown, msg_type='info')
+        
+        ## pnl
+        total_profit_till_t = np.sum(pft_till_t) if pft_till_t is not None else np.nan
+        
+        self.ding.send_markdown(f'HSR: {hsr:.2%}, PNL last period: {total_profit_till_t:.2%}', 
+                                pos_diff_in_markdown, msg_type='info')
         
     def _save_to_cache(self, ts, new_pos, pft_till_t):
         sp = self.params['sp']
