@@ -466,8 +466,8 @@ class PosUpdater:
         ## pos diff
         reindexed_w0 = w0.reindex(new_pos.index)
         pos_diff = new_pos - reindexed_w0
-        pos_diff = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
-        pos_diff_to_repo = np.round(pos_diff, decimals=4)
+        pos_diff_filtered = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
+        pos_diff_to_repo = np.round(pos_diff_filtered, decimals=4)
         pos_diff_in_markdown = df_to_markdown(pos_diff_to_repo, show_all=True, columns=['symbol', 'pos_diff'])
         
         ## hsr
@@ -484,7 +484,7 @@ class PosUpdater:
             'net_pnl': pnl_occurred - fee_occurred,
             })
             
-        self.ding.send_markdown(f"HSr: {hsr:.2%}, PnL last period: {period_pnl['net_pnl']:.2%}", 
+        self.ding.send_markdown(f"当期换手率: {hsr:.2%}, 上期净收益率: {period_pnl['net_pnl']:.2%}", 
                                 pos_diff_in_markdown, msg_type='info')
 
         return period_pnl
