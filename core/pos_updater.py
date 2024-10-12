@@ -542,7 +542,7 @@ class PosUpdater:
 
         # 从大到小排序
         sorted_pnl_per_symbol = net_per_symbol.sort_values(ascending=False)
-        sorted_pnl_per_symbol = filter_series(sorted_pnl_per_symbol, min_abs_value=0.0)
+        sorted_pnl_per_symbol = filter_series(sorted_pnl_per_symbol, min_abs_value=4e-3)
         
         # 将 sorted_pnl_per_symbol 的值转换为百分比格式
         pnl_per_symbol_percentage = sorted_pnl_per_symbol.apply(lambda x: f'{x:.2%}')
