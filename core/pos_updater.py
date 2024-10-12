@@ -177,8 +177,8 @@ class PosUpdater:
         interval = list(pos_update_interval.values())[0]
         
         self.task_scheduler.add_task('30 Minute Pos Update', unit, interval, self.update_once)
-        self.task_scheduler.add_task('Daily Pnl', unit, interval, self.calc_daily_pnl)
-        # self.task_scheduler.add_task('Daily Pnl', 'specific_time', ['00:00'], self.calc_daily_pnl)
+        # self.task_scheduler.add_task('Daily Pnl', unit, interval, self.calc_daily_pnl)
+        self.task_scheduler.add_task('Daily Pnl', 'specific_time', ['00:00'], self.calc_daily_pnl)
         self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', ['00:05'], 
                                      self.reload_exchange_info)
         
