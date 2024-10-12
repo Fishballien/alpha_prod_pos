@@ -59,7 +59,7 @@ class CacheManager(ParquetManager):
         self.cache_lookback = cache_lookback
         self.cache_list = cache_list
         
-        if self.cache_list:
+        if self.cache_list and self.log:
             self.log.success(f'Cache List Registered: {self.cache_list}')
 
         self._init_containers()
@@ -112,7 +112,7 @@ class PersistManager(ParquetManager):
     def _init_persist_list(self, persist_list):
         self.persist_list = persist_list
         
-        if self.persist_list:
+        if self.persist_list and self.log:
             self.log.success(f'Persist List Registered: {self.persist_list}')
             
         for persist_name in persist_list:
