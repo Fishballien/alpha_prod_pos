@@ -164,7 +164,13 @@ class PosUpdater:
         self.persist_mgr = PersistManager(self.persist_dir, persist_list=persist_list, log=self.log)
         
     def _add_tasks(self):
-        self.task_scheduler.add_task('30 Minute Pos Update', 'minute', 30, self.update_once)
+        pos_update_interval = self.params['pos_update_interval']
+        
+        unit = list(pos_update_interval.keys())[0]
+        interval = list(pos_update_interval.values())[0]
+        
+        self.task_scheduler.add_task('30 Minute Pos Update', unit, interval, self.update_once)
+        self.task_scheduler.add_task('Daily Pnl', 'specific_time', ['00:00'], self.calc_daily_pnl)
         self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', ['00:05'], 
                                      self.reload_exchange_info)
         
@@ -208,15 +214,17 @@ class PosUpdater:
             predict_value_matrix = self._fetch_predictions(ts)
             w0 = self._fetch_pre_pos()
             if predict_value_matrix is not None and w0 is not None:
-                self._log_po_start()
+                # self._log_po_start()
                 alpha = self._get_alpha(predict_value_matrix)
                 mm_t = self._get_momentum_at_t(ts)
                 his_pft_t = self._get_his_profit_at_t(ts)
                 w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t)
                 new_pos = self._update_positions_on_universal_set(w0, w1)
+                # TODO: send zmq
                 self._send_pos_to_db(new_pos)
                 pft_till_t = self._calc_profit_t_1_till_t(ts)
-                self._report_new_pos(new_pos)
+                # self._report_new_pos(new_pos)
+                self._report_pos_diff(new_pos, w0)
                 self._save_to_cache(ts, new_pos, pft_till_t)
                 self._save_to_persist(ts, alpha, new_pos, pft_till_t)
         except:
@@ -316,7 +324,7 @@ class PosUpdater:
                 if ts not in curr_price.index:
                     missing_ts.append(ts)
                 if pre_t not in curr_price.index:
-                    missing_ts.append(ts)
+                    missing_ts.append(pre_t)
                 self.log.warning(f'Timestamp: {missing_ts} is not in curr_price. Skip momentum calc for {mm_wd}.')
                 continue
             mm_wd_t = (curr_price.loc[ts] / curr_price.loc[pre_t] -1
@@ -427,6 +435,17 @@ class PosUpdater:
         pos_in_markdown = df_to_markdown(pos_to_repo, show_all=True, columns=['symbol', 'pos'])
         self.ding.send_markdown('SUCCESSFULLY SEND POSITION', pos_in_markdown, msg_type='success')
         
+    def _report_pos_diff(self, new_pos, w0):
+        pos_change_to_repo = self.params['pos_change_to_repo']
+        
+        reindexed_w0 = w0.reindex(new_pos.index)
+        pos_diff = new_pos - reindexed_w0
+        pos_diff = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
+        pos_diff_to_repo = np.round(pos_diff, decimals=4)
+        pos_diff_in_markdown = df_to_markdown(pos_diff_to_repo, show_all=True, columns=['symbol', 'pos_diff'])
+        hsr = pos_diff.abs().sum() / 2
+        self.ding.send_markdown(f'HSR: {hsr:.2%}', pos_diff_in_markdown, msg_type='info')
+        
     def _save_to_cache(self, ts, new_pos, pft_till_t):
         sp = self.params['sp']
 
@@ -451,4 +470,24 @@ class PosUpdater:
         else:
             self.log.warning(f'Failed to calc profit till {ts}. Skip saving persist: twap_profit.')
         self.persist_mgr.save(ts)
-
+        
+    def calc_daily_pnl(self, ts):
+        twap_profit = self.cache_mgr['twap_profit']
+        
+        daily_start_t = ts - timedelta(days=1)
+        twap_profit_since = twap_profit.loc[daily_start_t:]
+        if len(twap_profit_since) == 0:
+            return
+        pnl_per_symbol = twap_profit_since.sum(axis=1).fillna(0.0)
+        total_pnl = np.sum(pnl_per_symbol)
+        
+        # 按从大到小排序
+        sorted_pnl_per_symbol = pnl_per_symbol.sort_values(ascending=False)
+        
+        # 将排序后的结果转换为 DataFrame 并发送
+        pnl_df = sorted_pnl_per_symbol.to_frame(name='pnl_per_symbol')
+        pnl_markdown = df_to_markdown(pnl_df, show_all=True, columns=['symbol', 'pnl_per_symbol'])
+        
+        # 使用 HSR 格式，将 total_pnl 以百分比格式发送
+        self.ding.send_markdown(f'Total PnL: {total_pnl:.2%}', pnl_markdown, msg_type='info')
+    
