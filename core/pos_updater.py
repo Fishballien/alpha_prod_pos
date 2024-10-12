@@ -164,7 +164,7 @@ class PosUpdater:
         self.persist_mgr = PersistManager(self.persist_dir, persist_list=persist_list, log=self.log)
         
     def _add_tasks(self):
-        self.task_scheduler.add_task('30 Minute Pos Update', 'minute', 1, self.update_once)
+        self.task_scheduler.add_task('30 Minute Pos Update', 'minute', 30, self.update_once)
         self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', ['00:05'], 
                                      self.reload_exchange_info)
         
