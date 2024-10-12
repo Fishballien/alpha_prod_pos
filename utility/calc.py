@@ -13,6 +13,7 @@ emoji: 🔔 ⏳ ⏰ 🔒 🔓 🛑 🚫 ❗ ❓ ❌ ⭕ 🚀 🔥 💧 💡 🎵
 """
 # %% imports
 import numpy as np
+import pandas as pd
 
 
 # %%
@@ -54,4 +55,7 @@ def calc_profit_before_next_t(w0, w1, rtn_c2c, rtn_cw0, rtn_cw1):
     # Sum up all holding profits
     hold_pft = hold_pft1 + hold_pft2 + hold_pft3 + hold_pft4
     
-    return hold_pft
+    # Convert hold_pft to a pandas Series with w0's index
+    hold_pft_series = pd.Series(hold_pft, index=w0.index)
+    
+    return hold_pft_series
