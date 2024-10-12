@@ -481,13 +481,16 @@ class PosUpdater:
         pnl_per_symbol = twap_profit_since.sum(axis=1).fillna(0.0)
         total_pnl = np.sum(pnl_per_symbol)
         
-        # 按从大到小排序
+        # 从大到小排序
         sorted_pnl_per_symbol = pnl_per_symbol.sort_values(ascending=False)
         
-        # 将排序后的结果转换为 DataFrame 并发送
-        pnl_df = sorted_pnl_per_symbol.to_frame(name='pnl_per_symbol')
+        # 将 sorted_pnl_per_symbol 的值转换为百分比格式
+        pnl_per_symbol_percentage = sorted_pnl_per_symbol.apply(lambda x: f'{x:.2%}')
+        
+        # 将转换后的结果转换为 DataFrame 并发送
+        pnl_df = pnl_per_symbol_percentage.to_frame(name='pnl_per_symbol')
         pnl_markdown = df_to_markdown(pnl_df, show_all=True, columns=['symbol', 'pnl_per_symbol'])
         
-        # 使用 HSR 格式，将 total_pnl 以百分比格式发送
+        # 将 total_pnl 转换为百分比格式并发送
         self.ding.send_markdown(f'Total PnL: {total_pnl:.2%}', pnl_markdown, msg_type='info')
     
