@@ -533,8 +533,8 @@ class PosUpdater:
         fee_since = fee.loc[daily_start_t:]
         if len(twap_profit_since) == 0 or len(fee_since) == 0:
             return
-        pnl_per_symbol = twap_profit_since.sum(axis=1).fillna(0.0)
-        fee_per_symbol = fee_since.sum(axis=1).fillna(0.0)
+        pnl_per_symbol = twap_profit_since.sum(axis=0).fillna(0.0)
+        fee_per_symbol = fee_since.sum(axis=0).fillna(0.0)
         net_per_symbol = pnl_per_symbol - fee_per_symbol
         total_pnl = np.sum(pnl_per_symbol)
         total_fee = np.sum(fee_per_symbol)
