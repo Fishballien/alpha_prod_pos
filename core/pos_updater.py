@@ -33,7 +33,7 @@ from utility.dirutils import load_path_config
 from utility.logutils import FishStyleLogger
 from utility.market import usd, load_binance_data
 from utility.ding import DingReporter, df_to_markdown
-from utility.timeutils import parse_time_string
+from utility.timeutils import parse_time_string, get_date_based_on_timestamp
 from utility.calc import calc_profit_before_next_t
 from utility.datautils import filter_series
 from data_processor.data_checker import (FactorDataChecker, ModelPredictionChecker, 
@@ -157,12 +157,12 @@ class PosUpdater:
         self.pos_reader = PositionReader(mysql_name, self.stg_name, log=self.log)
         
     def _init_cache(self):
-        cache_list = ['curr_price', 'twap_price', 'pos_his', 'twap_profit']
+        cache_list = ['curr_price', 'twap_price', 'pos_his', 'twap_profit', 'fee', 'period_pnl']
         self.cache_mgr = CacheManager(self.cache_dir, cache_lookback=self.cache_lookback, 
                                       cache_list=cache_list, log=self.log)
         
     def _init_persist(self):
-        persist_list = ['alpha', 'pos_his', 'twap_profit']
+        persist_list = ['alpha', 'pos_his', 'twap_profit', 'fee', 'period_pnl']
         self.persist_mgr = PersistManager(self.persist_dir, persist_list=persist_list, log=self.log)
         
     def _init_signal_sender(self):
@@ -177,7 +177,8 @@ class PosUpdater:
         interval = list(pos_update_interval.values())[0]
         
         self.task_scheduler.add_task('30 Minute Pos Update', unit, interval, self.update_once)
-        self.task_scheduler.add_task('Daily Pnl', 'specific_time', ['00:00'], self.calc_daily_pnl)
+        self.task_scheduler.add_task('Daily Pnl', unit, interval, self.calc_daily_pnl)
+        # self.task_scheduler.add_task('Daily Pnl', 'specific_time', ['00:00'], self.calc_daily_pnl)
         self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', ['00:05'], 
                                      self.reload_exchange_info)
         
@@ -230,11 +231,11 @@ class PosUpdater:
                 new_pos = self._update_positions_on_universal_set(w0, w1)
                 self._send_pos_to_zmq(new_pos)
                 self._send_pos_to_db(new_pos)
-                pft_till_t = self._calc_profit_t_1_till_t(ts)
+                pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
                 # self._report_new_pos(new_pos)
-                self._report_pos_diff_and_pnl(new_pos, w0, pft_till_t)
-                self._save_to_cache(ts, new_pos, pft_till_t)
-                self._save_to_persist(ts, alpha, new_pos, pft_till_t)
+                period_pnl = self._record_n_repo_pos_diff_and_pnl(new_pos, w0, pft_till_t, fee_till_t)
+                self._save_to_cache(ts, new_pos, pft_till_t, fee_till_t, period_pnl)
+                self._save_to_persist(ts, alpha, new_pos, pft_till_t, fee_till_t, period_pnl)
         except:
             self.log.exception('update error')
             error_msg = traceback.format_exc()  # 获取完整的异常信息
@@ -408,6 +409,7 @@ class PosUpdater:
         
     def _calc_profit_t_1_till_t(self, ts): # 计算t-1至t的收益
         sp = self.params['sp']
+        fee_rate = self.params['fee_rate']
 
         interval = timedelta(seconds=parse_time_string(sp))
         pre_t_1 = ts - interval
@@ -431,7 +433,7 @@ class PosUpdater:
                 extracted_data[key] = self.cache_mgr[cache_name].loc[index]
             except KeyError:
                 self.log.warning(f"KeyError: {index} not found in {cache_name}. Skip calc_profit.")
-                return None  # 如果有 KeyError，直接返回 None 或者抛出异常
+                return None, None  # 如果有 KeyError，直接返回 None 或者抛出异常
             
         for key in extracted_data:
             extracted_data[key] = extracted_data[key].reindex(extracted_data['w_t_1'].index)
@@ -445,7 +447,11 @@ class PosUpdater:
         pft_till_t = calc_profit_before_next_t(extracted_data['w_t_2'], 
                                                extracted_data['w_t_1'], 
                                                rtn_c2c, rtn_cw0, rtn_cw1)
-        return pft_till_t # TODO: to cache (index: t-1) & to persist (index: t)
+        
+        # 计算fee
+        fee_till_t = np.abs(extracted_data['w_t_1'] - extracted_data['w_t_2']) * fee_rate
+        
+        return pft_till_t, fee_till_t # TODO: to cache (index: t-1) & to persist (index: t)
         
     def _report_new_pos(self, new_pos):
         pos_to_repo = filter_series(new_pos, min_abs_value=0)
@@ -453,24 +459,37 @@ class PosUpdater:
         pos_in_markdown = df_to_markdown(pos_to_repo, show_all=True, columns=['symbol', 'pos'])
         self.ding.send_markdown('SUCCESSFULLY SEND POSITION', pos_in_markdown, msg_type='success')
         
-    def _report_pos_diff_and_pnl(self, new_pos, w0, pft_till_t):
+    def _record_n_repo_pos_diff_and_pnl(self, new_pos, w0, pft_till_t, fee_till_t): 
+        # !!!: 算的是上期pnl和当期会发生的fee，为粗略计算，否则会比较复杂
         pos_change_to_repo = self.params['pos_change_to_repo']
-        
+
         ## pos diff
         reindexed_w0 = w0.reindex(new_pos.index)
         pos_diff = new_pos - reindexed_w0
         pos_diff = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
         pos_diff_to_repo = np.round(pos_diff, decimals=4)
         pos_diff_in_markdown = df_to_markdown(pos_diff_to_repo, show_all=True, columns=['symbol', 'pos_diff'])
+        
+        ## hsr
         hsr = pos_diff.abs().sum() / 2
         
-        ## pnl
-        total_profit_till_t = np.sum(pft_till_t) if pft_till_t is not None else np.nan
+        ## agg pnl & fee
+        pnl_occurred = np.sum(pft_till_t) if pft_till_t is not None else np.nan
+        fee_occurred = np.sum(fee_till_t) if fee_till_t is not None else 0
         
-        self.ding.send_markdown(f'HSR: {hsr:.2%}, PNL last period: {total_profit_till_t:.2%}', 
+        ## period net pnl
+        period_pnl = pd.Series({
+            'pnl': pnl_occurred, 
+            'fee': fee_occurred,
+            'net_pnl': pnl_occurred - fee_occurred,
+            })
+            
+        self.ding.send_markdown(f"HSR: {hsr:.2%}, PNL last period: {period_pnl['net_pnl']:.2%}", 
                                 pos_diff_in_markdown, msg_type='info')
+
+        return period_pnl
         
-    def _save_to_cache(self, ts, new_pos, pft_till_t):
+    def _save_to_cache(self, ts, new_pos, pft_till_t, fee_till_t, period_pnl):
         sp = self.params['sp']
 
         interval = timedelta(seconds=parse_time_string(sp))
@@ -482,9 +501,14 @@ class PosUpdater:
             self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
         else:
             self.log.warning(f'Failed to calc profit during {pre_t_1} - {ts}. Skip saving cache: twap_profit.')
+        if fee_till_t is not None:
+            self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
+        else:
+            self.log.warning(f'Failed to calc fee during {pre_t_1} - {ts}. Skip saving cache: fee.')
+        self.cache_mgr.add_row('period_pnl', period_pnl, pre_t_1)
         self.cache_mgr.save(ts)
         
-    def _save_to_persist(self, ts, alpha, new_pos, pft_till_t):
+    def _save_to_persist(self, ts, alpha, new_pos, pft_till_t, fee_till_t, period_pnl):
         if alpha is not None:
             self.persist_mgr.add_row('alpha', alpha, ts)
         if new_pos is not None:
@@ -493,20 +517,31 @@ class PosUpdater:
             self.persist_mgr.add_row('twap_profit', pft_till_t, ts)
         else:
             self.log.warning(f'Failed to calc profit till {ts}. Skip saving persist: twap_profit.')
+        if fee_till_t is not None:
+            self.persist_mgr.add_row('fee', fee_till_t, ts)
+        else:
+            self.log.warning(f'Failed to calc fee till {ts}. Skip saving persist: fee.')
+        self.persist_mgr.add_row('period_pnl', period_pnl, ts)
         self.persist_mgr.save(ts)
         
     def calc_daily_pnl(self, ts):
         twap_profit = self.cache_mgr['twap_profit']
+        fee = self.cache_mgr['fee']
         
         daily_start_t = ts - timedelta(days=1)
         twap_profit_since = twap_profit.loc[daily_start_t:]
-        if len(twap_profit_since) == 0:
+        fee_since = fee.loc[daily_start_t:]
+        if len(twap_profit_since) == 0 or len(fee_since) == 0:
             return
         pnl_per_symbol = twap_profit_since.sum(axis=1).fillna(0.0)
+        fee_per_symbol = fee_since.sum(axis=1).fillna(0.0)
+        net_per_symbol = pnl_per_symbol - fee_per_symbol
         total_pnl = np.sum(pnl_per_symbol)
+        total_fee = np.sum(fee_per_symbol)
+        net_pnl = total_pnl - total_fee
         
         # 从大到小排序
-        sorted_pnl_per_symbol = pnl_per_symbol.sort_values(ascending=False)
+        sorted_pnl_per_symbol = net_per_symbol.sort_values(ascending=False)
         
         # 将 sorted_pnl_per_symbol 的值转换为百分比格式
         pnl_per_symbol_percentage = sorted_pnl_per_symbol.apply(lambda x: f'{x:.2%}')
@@ -516,5 +551,7 @@ class PosUpdater:
         pnl_markdown = df_to_markdown(pnl_df, show_all=True, columns=['symbol', 'pnl_per_symbol'])
         
         # 将 total_pnl 转换为百分比格式并发送
-        self.ding.send_markdown(f'Total PnL: {total_pnl:.2%}', pnl_markdown, msg_type='info')
+        date = get_date_based_on_timestamp(daily_start_t)
+        title = f'[{date}] PnL: {total_pnl:.2%}, FEE: {total_fee:.2%}, NET: {net_pnl:.2%}'
+        self.ding.send_markdown(title, pnl_markdown, msg_type='info')
     
