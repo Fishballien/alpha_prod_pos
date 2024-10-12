@@ -110,7 +110,7 @@ class PosUpdater:
         pf_limits = optimizer_params['pf_limits']
         cache_lookback = self.params['cache']['cache_lookback']
         
-        self.delay_mapping = {delay: timedelta(parse_time_string(delay)) for delay in delay_fetch}
+        self.delay_mapping = {delay: timedelta(seconds=parse_time_string(delay)) for delay in delay_fetch}
         self.mmt_limits_mapping = {mmt_wd: timedelta(seconds=parse_time_string(mmt_wd)) for mmt_wd in momentum_limits}
         self.pf_limits_mapping = {pf_wd: timedelta(seconds=parse_time_string(pf_wd)) for pf_wd in pf_limits}
         self.cache_lookback = timedelta(seconds=parse_time_string(cache_lookback))
@@ -164,7 +164,7 @@ class PosUpdater:
         self.persist_mgr = PersistManager(self.persist_dir, persist_list=persist_list, log=self.log)
         
     def _add_tasks(self):
-        self.task_scheduler.add_task('30 Minute Pos Update', 'minute', 30, self.update_once)
+        self.task_scheduler.add_task('30 Minute Pos Update', 'minute', 1, self.update_once)
         self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', ['00:05'], 
                                      self.reload_exchange_info)
         
@@ -242,7 +242,7 @@ class PosUpdater:
             dc = FactorDataChecker(self.trading_symbols, columns, ts_to_check, **data_check_params, log=self.log)
             
             fetch_n_check_once_func = partial(fetch_n_check_once, fetch_func=self.factor_reader.fetch_batch_data,
-                                                   list_to_fetch=factors_to_fetch, dc=dc)
+                                              list_to_fetch=factors_to_fetch, dc=dc)
             factor_value_matrix = fetch_n_check(fetch_n_check_once_func, fetch_target_name=factor['factor'],
                                                 log=self.log, repo=self.ding, **fetch_params)
             
@@ -320,7 +320,7 @@ class PosUpdater:
                 self.log.warning(f'Timestamp: {missing_ts} is not in curr_price. Skip momentum calc for {mm_wd}.')
                 continue
             mm_wd_t = (curr_price.loc[ts] / curr_price.loc[pre_t] -1
-                       ).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
+                       ).replace([np.inf, -np.inf], np.nan).reindex(self.trading_symbols).fillna(0.0).values
             mm_t[mm_wd] = mm_wd_t
         return mm_t
     
@@ -338,7 +338,7 @@ class PosUpdater:
             if len(twap_profit_since) == 0:
                 self.log.warning(f'Found no profit record since {pre_t}. Skip his profit calc for {pf_wd}.')
                 continue
-            pf_wd_t = twap_profit_since.sum(axis=0).values
+            pf_wd_t = twap_profit_since.sum(axis=0).reindex(self.trading_symbols).values
             his_pft_t[pf_wd] = pf_wd_t
         return his_pft_t
     
@@ -406,6 +406,9 @@ class PosUpdater:
             except KeyError:
                 self.log.warning(f"KeyError: {index} not found in {cache_name}. Skip calc_profit.")
                 return None  # 如果有 KeyError，直接返回 None 或者抛出异常
+            
+        for key in extracted_data:
+            extracted_data[key] = extracted_data[key].reindex(extracted_data['w_t_1'].index)
     
         # 直接在后续计算中使用 extracted_data 的值
         rtn_c2c = extracted_data['close_price_t_1'] / extracted_data['close_price_t_2'] - 1
