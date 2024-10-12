@@ -539,7 +539,7 @@ class PosUpdater:
         total_pnl = np.sum(pnl_per_symbol)
         total_fee = np.sum(fee_per_symbol)
         net_pnl = total_pnl - total_fee
-        
+
         # 从大到小排序
         sorted_pnl_per_symbol = net_per_symbol.sort_values(ascending=False)
         
@@ -547,11 +547,12 @@ class PosUpdater:
         pnl_per_symbol_percentage = sorted_pnl_per_symbol.apply(lambda x: f'{x:.2%}')
         
         # 将转换后的结果转换为 DataFrame 并发送
-        pnl_df = pnl_per_symbol_percentage.to_frame(name='pnl_per_symbol')
-        pnl_markdown = df_to_markdown(pnl_df, show_all=True, columns=['symbol', 'pnl_per_symbol'])
+        pnl_markdown = df_to_markdown(pnl_per_symbol_percentage, show_all=True, 
+                                      columns=['symbol', 'pnl_per_symbol'])
         
         # 将 total_pnl 转换为百分比格式并发送
         date = get_date_based_on_timestamp(daily_start_t)
         title = f'[{date}] PnL: {total_pnl:.2%}, FEE: {total_fee:.2%}, NET: {net_pnl:.2%}'
+        self.log.info(title)
         self.ding.send_markdown(title, pnl_markdown, msg_type='info')
     
