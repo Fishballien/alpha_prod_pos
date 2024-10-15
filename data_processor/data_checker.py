@@ -109,18 +109,24 @@ class DataChecker(ABC):
             content_str = "\n".join([f"{symbol} - {factor}" for symbol, factor in self.missing_pairs])
             self._log_and_send(title_str, content_str, verbose)
 
-    def _log_low_completeness(self, title, completeness_dict, verbose):
+    def _log_low_completeness(self, title, completeness_dict, verbose, threshold=20):
         """
         处理低完整率的 symbol/factor 的日志和报警。
         :param title: 标题
         :param completeness_dict: 完整率字典
         :param verbose: 是否发送 repo 报告
+        :param threshold: 完整率检查对象的数量阈值，默认为 20
         """
-        low_completeness_items = {k: v for k, v in completeness_dict.items() if v['data'] < self.symbol_threshold * 100 or v['time'] < self.symbol_threshold * 100}
-
+        low_completeness_items = {k: v for k, v in completeness_dict.items() 
+                                  if v['data'] < self.symbol_threshold * 100 or v['time'] < self.symbol_threshold * 100}
+    
         if low_completeness_items:
             title_str = title.upper()
-            content_str = "\n".join([f"{item}: data={v['data']}%, time={v['time']}%" for item, v in low_completeness_items.items()])
+            if len(low_completeness_items) > threshold:
+                content_str = f"超过 {threshold} 个检查对象低完整率，数量为 {len(low_completeness_items)}."
+            else:
+                content_str = "\n".join([f"{item}: data={v['data']}%, time={v['time']}%" 
+                                         for item, v in low_completeness_items.items()])
             self._log_and_send(title_str, content_str, verbose)
 
     def _log_and_send(self, title_str, content_str, verbose):
