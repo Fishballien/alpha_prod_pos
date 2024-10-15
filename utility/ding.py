@@ -18,10 +18,13 @@ import pandas as pd
 
 # %%
 class DingReporter:
-    
+
     def __init__(self, config):
         self._url = config['url']
         self._secret = config['secret']
+        self._header = config.get('header', '')  # Get the header from config, default to an empty string if not provided
+        # Define header text during initialization with gray color and smaller font size
+        self._header_text = f"<font color=\"gray\" size=\"1\"><b>{self._header}</b></font>\n\n" if self._header else ''
 
     def _sign(self):
         # 当前时刻
@@ -31,7 +34,6 @@ class DingReporter:
         string_to_sign_enc = '{}\n{}'.format(timestamp, self._secret).encode('utf-8')
         hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
         sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-        # print(timestamp, secret_enc, string_to_sign_enc, hmac_code, sign)
         return timestamp, sign
 
     def send_text(self, text, msg_type='info'):
@@ -44,16 +46,16 @@ class DingReporter:
             color = 'red'
         else:
             color = 'black'
-        
-        # 使用HTML标签设置文本颜色
-        formatted_text = f"<font color=\"{color}\">{text}</font>"
-    
+
+        # 使用HTML标签设置文本颜色，第一行加上 header
+        formatted_text = f"{self._header_text}<font color=\"{color}\">{text}</font>"
+
         # 定义Markdown消息
         headers = {'content-type': 'application/json'}
         data = {
             'msgtype': 'markdown',
             'markdown': {
-                'title': text, 
+                'title': text,
                 'text': formatted_text
             }
         }
@@ -65,7 +67,7 @@ class DingReporter:
         except Exception as e:
             print(e)
             print('retry later')
-            
+
     def send_markdown(self, title, markdown_text, msg_type='info'):
         # 定义不同类型的标题颜色
         if msg_type == 'success':
@@ -76,25 +78,27 @@ class DingReporter:
             color = 'red'
         else:
             color = 'black'
-        
+
         # 通过HTML标签设置标题的颜色，并加粗
         formatted_title = f"<font color=\"{color}\"><b>{title}</b></font>"
-        
+
+        # 将 header 加入 markdown_text
+        full_markdown_text = f"{self._header_text}{formatted_title}\n\n{markdown_text}"
+
         # 定义Markdown消息类型
         headers = {'content-type': 'application/json'}
-        # 将 formatted_title 添加到 markdown_text 的内容中
         data = {
             'msgtype': 'markdown',
             'markdown': {
                 'title': title,
-                'text': f"{formatted_title}\n\n{markdown_text}"  # 将加粗和带颜色的标题添加到 Markdown 内容中
+                'text': full_markdown_text
             }
         }
-        
+
         ts, signature = self._sign()
         try:
             # 发送POST请求
-            requests.post('{}&timestamp={}&sign={}'.format(self._url, ts, signature), 
+            requests.post('{}&timestamp={}&sign={}'.format(self._url, ts, signature),
                           data=json.dumps(data), headers=headers)
         except Exception as e:
             print(e)
