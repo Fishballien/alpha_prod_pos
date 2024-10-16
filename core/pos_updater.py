@@ -373,12 +373,12 @@ class PosUpdater:
         reindexed_w0 = w0.reindex(alpha.index, fill_value=0)
         w1, status = self.opt_func(alpha, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L0)
         if status != "optimal":
-            msg = 'Could not find optimal result under to_rate: {to_rate_thresh_L0}, try {to_rate_thresh_L1}.'
+            msg = f'Could not find optimal result under to_rate: {to_rate_thresh_L0}, try {to_rate_thresh_L1}.'
             self.log.warning(msg)
             self.ding.send_text(msg, msg_type='warning')
             w1, status = self.opt_func(alpha, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L1)
             if status != "optimal":
-                msg = ('Still could not find optimal result under to_rate: {to_rate_thresh_L1}, '
+                msg = (f'Still could not find optimal result under to_rate: {to_rate_thresh_L1}, '
                        'maintain previous pos.')
                 self.log.warning(msg)
                 self.ding.send_text(msg, msg_type='warning')
