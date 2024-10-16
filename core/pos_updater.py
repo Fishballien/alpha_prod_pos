@@ -222,20 +222,25 @@ class PosUpdater:
             self._fetch_factors(ts)
             predict_value_matrix = self._fetch_predictions(ts)
             w0 = self._fetch_pre_pos()
-            if predict_value_matrix is not None and w0 is not None:
+            if w0 is None:
+                return
+            if predict_value_matrix is not None:
                 # self._log_po_start()
                 alpha = self._get_alpha(predict_value_matrix)
                 mm_t = self._get_momentum_at_t(ts)
                 his_pft_t = self._get_his_profit_at_t(ts)
                 w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t)
-                new_pos = self._update_positions_on_universal_set(w0, w1)
-                self._send_pos_to_zmq(new_pos)
-                self._send_pos_to_db(new_pos)
-                pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
-                # self._report_new_pos(new_pos)
-                period_pnl = self._record_n_repo_pos_diff_and_pnl(new_pos, w0, pft_till_t, fee_till_t)
-                self._save_to_cache(ts, new_pos, pft_till_t, fee_till_t, period_pnl)
-                self._save_to_persist(ts, alpha, new_pos, pft_till_t, fee_till_t, period_pnl)
+            else:
+                w1 = w0
+                self._repo_model_error()
+            new_pos = self._update_positions_on_universal_set(w0, w1)
+            self._send_pos_to_zmq(new_pos)
+            self._send_pos_to_db(new_pos)
+            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
+            # self._report_new_pos(new_pos)
+            period_pnl = self._record_n_repo_pos_diff_and_pnl(new_pos, w0, pft_till_t, fee_till_t)
+            self._save_to_cache(ts, new_pos, pft_till_t, fee_till_t, period_pnl)
+            self._save_to_persist(ts, alpha, new_pos, pft_till_t, fee_till_t, period_pnl)
         except:
             self.log.exception('update error')
             error_msg = traceback.format_exc()  # 获取完整的异常信息
@@ -379,6 +384,13 @@ class PosUpdater:
                 self.ding.send_text(msg, msg_type='warning')
         w1 = filter_series(w1, min_abs_value=min_pos, remove=False)
         return w1
+    
+    def _repo_model_error(self):
+        model_name = self.params['model_name']
+        
+        msg = f'无法获取最新预测值，沿用上期仓位，请尽快修复模型端 {model_name} 问题！'
+        self.log.warning(msg)
+        self.ding.send_text(msg, msg_type='warning')
     
     def _update_positions_on_universal_set(self, w0, w1):
         # Step 1: 对于上期存在但当期没有的币种，保留它们并将仓位设为0
