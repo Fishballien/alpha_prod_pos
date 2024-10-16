@@ -27,7 +27,7 @@ class DataChecker(ABC):
     
     def __init__(self, symbols, columns, ts, time_threshold=timedelta(minutes=30), 
                  symbol_threshold=0.9, factor_threshold=0.9, valid_rate=0.9, 
-                 verbose_symbol=1, verbose_factor=1, verbose_pair=0,
+                 verbose_symbol_thresh=20, verbose_factor_thresh=20, verbose_pair_thresh=20,
                  log=None, repo=None):
         """
         :param symbols: 排序好的 symbol 列表
@@ -46,9 +46,9 @@ class DataChecker(ABC):
         self.symbol_threshold = symbol_threshold
         self.factor_threshold = factor_threshold
         self.valid_rate = valid_rate
-        self.verbose_symbol = verbose_symbol
-        self.verbose_factor = verbose_factor
-        self.verbose_pair = verbose_pair
+        self.verbose_symbol_thresh = verbose_symbol_thresh
+        self.verbose_factor_thresh = verbose_factor_thresh
+        self.verbose_pair_thresh = verbose_pair_thresh
         self.log = log or FishStyleLogger()  # 使用自定义日志类 FishStyleLogger
         self.repo = repo
         
