@@ -119,7 +119,7 @@ class DataChecker(ABC):
             title_str = "Individual missing symbol-factor pairs".upper()
             if len(self.missing_pairs) < self.verbose_pair_thresh:
                 content_str = "\n".join([f"{symbol} - {factor}" for symbol, factor in self.missing_pairs])
-                self._log_and_send(title_str, content_str)
+                self._log_and_send(title_str, content_str, verbose)
 
     def _log_low_completeness(self, title, completeness_dict, completeness_threshold, verbose, threshold=20):
         """
