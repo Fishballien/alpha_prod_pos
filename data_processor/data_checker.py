@@ -26,7 +26,9 @@ from utility.logutils import FishStyleLogger
 class DataChecker(ABC):
     
     def __init__(self, symbols, columns, ts, time_threshold=timedelta(minutes=30), 
-                 symbol_threshold=0.9, factor_threshold=0.9, log=None, repo=None):
+                 symbol_threshold=0.9, factor_threshold=0.9, valid_rate=0.9, 
+                 verbose_symbol=1, verbose_factor=1, verbose_pair=0,
+                 log=None, repo=None):
         """
         :param symbols: 排序好的 symbol 列表
         :param columns: 包含fetched data中可能出现的多个字段信息组合
@@ -38,11 +40,15 @@ class DataChecker(ABC):
         :param repo: repo 对象，用于发送 markdown 信息
         """
         self.symbols = symbols
-        self.columns = [tuple(col) if isinstance(col, list) else col for col in columns]
+        self.columns = [tuple(col) if isinstance(col, (np.record, list)) else col for col in columns]
         self.ts = ts
         self.time_threshold = time_threshold
         self.symbol_threshold = symbol_threshold
         self.factor_threshold = factor_threshold
+        self.valid_rate = valid_rate
+        self.verbose_symbol = verbose_symbol
+        self.verbose_factor = verbose_factor
+        self.verbose_pair = verbose_pair
         self.log = log or FishStyleLogger()  # 使用自定义日志类 FishStyleLogger
         self.repo = repo
         
@@ -85,9 +91,10 @@ class DataChecker(ABC):
         self.missing_pairs = self._check_individual_missing(data_matrix, time_matrix)
 
         # 判断是否所有 factor 的 data 和 time 完整性都高于阈值
-        return all(self.factor_completeness[factor]['data'] >= self.factor_threshold * 100 and 
-                   self.factor_completeness[factor]['time'] >= self.factor_threshold * 100
-                   for factor in self.factor_completeness)
+        valid_or_not = [self.factor_completeness[factor]['data'] >= self.factor_threshold * 100 and 
+                       self.factor_completeness[factor]['time'] >= self.factor_threshold * 100
+                       for factor in self.factor_completeness]
+        return np.mean(valid_or_not) >= self.valid_rate
 
     def log_and_report(self, verbose):
         """
@@ -98,18 +105,23 @@ class DataChecker(ABC):
             return
         
         # 打印低于阈值的 symbol
-        self._log_low_completeness('Symbols with low completeness', self.symbol_completeness, verbose)
+        if self.verbose_symbol_thresh:
+            self._log_low_completeness('Symbols with low completeness', self.symbol_completeness, 
+                                       self.symbol_threshold, verbose, self.verbose_symbol_thresh)
         
         # 打印低于阈值的 factor
-        self._log_low_completeness('Factor combinations with low completeness', self.factor_completeness, verbose)
-        
+        if self.verbose_factor_thresh:
+            self._log_low_completeness('Factor combinations with low completeness', self.factor_completeness, 
+                                       self.factor_threshold, verbose, self.verbose_factor_thresh)
+            
         # 打印单独缺失的 symbol-factor 对
-        if self.missing_pairs:
+        if self.missing_pairs and self.verbose_pair_thresh:
             title_str = "Individual missing symbol-factor pairs".upper()
-            content_str = "\n".join([f"{symbol} - {factor}" for symbol, factor in self.missing_pairs])
-            self._log_and_send(title_str, content_str, verbose)
+            if len(self.missing_pairs) < self.verbose_pair_thresh:
+                content_str = "\n".join([f"{symbol} - {factor}" for symbol, factor in self.missing_pairs])
+                self._log_and_send(title_str, content_str)
 
-    def _log_low_completeness(self, title, completeness_dict, verbose, threshold=20):
+    def _log_low_completeness(self, title, completeness_dict, completeness_threshold, verbose, threshold=20):
         """
         处理低完整率的 symbol/factor 的日志和报警。
         :param title: 标题
@@ -118,12 +130,13 @@ class DataChecker(ABC):
         :param threshold: 完整率检查对象的数量阈值，默认为 20
         """
         low_completeness_items = {k: v for k, v in completeness_dict.items() 
-                                  if v['data'] < self.symbol_threshold * 100 or v['time'] < self.symbol_threshold * 100}
+                                  if v['data'] < completeness_threshold * 100 
+                                  or v['time'] < completeness_threshold * 100}
     
         if low_completeness_items:
             title_str = title.upper()
-            if len(low_completeness_items) > threshold:
-                content_str = f"超过 {threshold} 个检查对象低完整率，数量为 {len(low_completeness_items)}."
+            if len(low_completeness_items) >= threshold:
+                content_str = f"超过 {threshold} 个检查对象低完整率，数量为 {len(low_completeness_items)}"
             else:
                 content_str = "\n".join([f"{item}: data={v['data']}%, time={v['time']}%" 
                                          for item, v in low_completeness_items.items()])
@@ -133,9 +146,10 @@ class DataChecker(ABC):
         """
         统一日志打印和 repo 发送逻辑
         """
-        result_str = f'[{title_str}]\n{content_str}'
-        self.log.warning(result_str.strip())
-        if verbose and self.repo:
+        if verbose >= 0:
+            result_str = f'[{title_str}]\n{content_str}'
+            self.log.warning(result_str.strip())
+        if verbose >= 1 and self.repo:
             self.repo.send_markdown(title_str, content_str, msg_type='warning')
     
     @abstractmethod
@@ -151,7 +165,6 @@ class DataChecker(ABC):
 
         for row in fetched_data:
             factor_combination, symbol, factor_value, timestamp = self._read_one_row(row)
-
             if factor_combination in self.columns:
                 data_matrix.at[symbol, factor_combination] = 1
                 time_diff = self.ts - timestamp
