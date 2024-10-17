@@ -269,6 +269,11 @@ class PosUpdater:
                                                 log=self.log, repo=self.ding, **fetch_params)
             
             cache_name = 'curr_price' if factor['factor'].startswith('curr_price') else 'twap_price'
+            if factor_value_matrix is None:
+                msg = f'Failed to fetch {cache_name}!'
+                self.log.warning(msg)
+                self.ding.send_text(msg, msg_type='error')
+                continue
             self.cache_mgr.add_row(cache_name, factor_value_matrix[factor_in_tuple], ts_to_check)
     
     def _fetch_predictions(self, ts):
