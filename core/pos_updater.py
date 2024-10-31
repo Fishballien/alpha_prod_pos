@@ -220,6 +220,7 @@ class PosUpdater:
     def update_once(self, ts):
         try:
             self._fetch_factors(ts)
+            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
             predict_value_matrix = self._fetch_predictions(ts)
             w0 = self._fetch_pre_pos()
             if w0 is None:
@@ -236,7 +237,7 @@ class PosUpdater:
             new_pos = self._update_positions_on_universal_set(w0, w1)
             self._send_pos_to_zmq(new_pos)
             self._send_pos_to_db(new_pos)
-            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
+            # pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
             # self._report_new_pos(new_pos)
             period_pnl = self._record_n_repo_pos_diff_and_pnl(new_pos, w0, pft_till_t, fee_till_t)
             self._save_to_cache(ts, new_pos, pft_till_t, fee_till_t, period_pnl)

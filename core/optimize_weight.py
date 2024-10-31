@@ -20,11 +20,11 @@ import pandas as pd
 # %% simple
 def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh, 
                                    max_multi=1, max_wgt=None, momentum_limits={}, pf_limits={}):
-# =============================================================================
-#     # 过滤和调整输入数据
-#     w0 = w0 - np.mean(w0) # ???
-#     w0 = w0 / np.sum(np.abs(w0)) if np.sum(np.abs(w0)) != 0 else w0
-# =============================================================================
+    # 过滤和调整输入数据
+    w0 = w0 - np.mean(w0)
+    w0 = w0 / np.sum(np.abs(w0)) if np.sum(np.abs(w0)) != 0 else w0
+
+    # breakpoint()
     
     # 定义变量
     n = alpha.size
@@ -59,7 +59,8 @@ def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh,
         try:
             mm_sum = cp.sum(mm_t[mm_wd] @ w)
         except:
-            breakpoint()
+            print(mm_wd)
+            continue
         mm_thres = momentum_limits[mm_wd]
         constraints += [
             mm_sum >= - mm_thres,
@@ -81,11 +82,13 @@ def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh,
     try:
         problem.solve(solver=cp.ECOS, verbose=False)
     except:
-        return w0, 'error', None
+        return w0, 'error'
     w1 = w.value
 
     # 定义和求解问题
     try:
+        # if pd.Series(w1).abs().sum() == 0:
+        #     breakpoint()
         w1 = w1 / pd.Series(w1).abs().sum()
     except:
         w1 = w0
