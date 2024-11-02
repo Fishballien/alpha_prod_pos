@@ -388,6 +388,10 @@ class PosUpdater:
                 msg = (f'Still could not find optimal result under to_rate: {to_rate_thresh_L1}, '
                        'maintain previous pos.')
                 self.log.warning(msg)
+                self.log.warning(f'alpha: {alpha}')
+                self.log.warning(f'reindexed_w0: {reindexed_w0}')
+                self.log.warning(f'mm_t: {mm_t}')
+                self.log.warning(f'his_pft_t: {his_pft_t}')
                 self.ding.send_text(msg, msg_type='warning')
         w1 = filter_series(w1, min_abs_value=min_pos, remove=False)
         return w1
