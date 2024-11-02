@@ -386,7 +386,7 @@ class PosUpdater:
             w1, status = self.opt_func(alpha, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L1)
             if status != "optimal":
                 msg = (f'Still could not find optimal result under to_rate: {to_rate_thresh_L1}, '
-                       'maintain previous pos.')
+                       'remain previous pos.')
                 self.log.warning(msg)
                 self.log.warning(f'alpha: {alpha}')
                 self.log.warning(f'reindexed_w0: {reindexed_w0}')
