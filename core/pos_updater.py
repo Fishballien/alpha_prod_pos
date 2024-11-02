@@ -233,6 +233,7 @@ class PosUpdater:
                 w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t)
             else:
                 w1 = w0
+                alpha = None
                 self._repo_model_error()
             new_pos = self._update_positions_on_universal_set(w0, w1)
             self._send_pos_to_zmq(new_pos)
