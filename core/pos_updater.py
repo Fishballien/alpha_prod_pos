@@ -417,16 +417,42 @@ class PosUpdater:
         
         return new_pos
     
-    def _send_pos_to_zmq(self, new_pos):
+    def _send_pos_to_zmq(self, new_pos, ts):
         zmq_params = self.params['zmq']
         strategy_name = zmq_params['strategy_name']
         exchange = zmq_params['exchange']
         symbol_type = zmq_params['symbol_type']
+
+        ma_price_reindexed = self._get_ma_price(new_pos, ts)
+        new_pos_in_coin = (new_pos / ma_price_reindexed).replace([np.nan, np.inf, -np.inf], 0)
         
-        for symbol, pos in new_pos.items():
+        for symbol, pos in new_pos_in_coin.items():
             symbol_upper = symbol.upper()  # 转为大写
             self.signal_sender.send_message(strategy_name, exchange, symbol_type, symbol_upper, str(pos))
-
+            
+    def _get_ma_price(self, new_pos, ts):
+        sp = self.params['sp']
+        ma_price_params = self.params['ma_price']
+        ma_wd = ma_price_params['ma_wd']
+        check_thres = ma_price_params['check_thres']
+        
+        interval = timedelta(seconds=parse_time_string(sp))
+        start_ma_t = ts - interval * ma_wd
+        curr_price = self.cache_mgr['curr_price']
+        ts_price = curr_price.loc[ts]
+        ma_price = curr_price.loc[start_ma_t:].mean(axis=0)
+        
+        px_chg = (ts_price - ma_price) / ma_price
+        abnormal = px_chg.abs() > check_thres
+        px_chg_abn = px_chg[abnormal]
+        if len(px_chg_abn) > 0:
+            msg = f'可能异常的价格波动: {px_chg_abn}'
+            self.log.warning(msg)
+            self.ding.send_markdown("异常价格波动告警，请及时查看是否为真实价格，否则可能导致下单数量错误", 
+                                    msg, msg_type='warning')
+        
+        return ma_price.loc[ts].reindex(new_pos.index)
+        
     def _send_pos_to_db(self, new_pos):
         self.pos_sender.insert(new_pos)
         
