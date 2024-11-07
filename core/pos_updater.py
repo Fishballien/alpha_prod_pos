@@ -422,9 +422,10 @@ class PosUpdater:
         strategy_name = zmq_params['strategy_name']
         exchange = zmq_params['exchange']
         symbol_type = zmq_params['symbol_type']
+        capital = self.params['capital']
 
         ma_price_reindexed = self._get_ma_price(new_pos, ts)
-        new_pos_in_coin = (new_pos / ma_price_reindexed).replace([np.nan, np.inf, -np.inf], 0)
+        new_pos_in_coin = (new_pos / ma_price_reindexed * capital).replace([np.nan, np.inf, -np.inf], 0)
         
         for symbol, pos in new_pos_in_coin.items():
             symbol_upper = symbol.upper()  # 转为大写
