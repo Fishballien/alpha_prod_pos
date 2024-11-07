@@ -236,7 +236,7 @@ class PosUpdater:
                 alpha = None
                 self._repo_model_error()
             new_pos = self._update_positions_on_universal_set(w0, w1)
-            self._send_pos_to_zmq(new_pos)
+            self._send_pos_to_zmq(new_pos, ts)
             self._send_pos_to_db(new_pos)
             # pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
             # self._report_new_pos(new_pos)
