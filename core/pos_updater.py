@@ -449,10 +449,11 @@ class PosUpdater:
         if len(px_chg_abn) > 0:
             msg = f'可能异常的价格波动: {px_chg_abn}'
             self.log.warning(msg)
+            px_chg_abn_in_markdown = df_to_markdown(px_chg_abn, show_all=True, columns=['symbol', 'price change'])
             self.ding.send_markdown("异常价格波动告警，请及时查看是否为真实价格，否则可能导致下单数量错误", 
-                                    msg, msg_type='warning')
+                                    px_chg_abn_in_markdown, msg_type='warning')
         
-        return ma_price.loc[ts].reindex(new_pos.index)
+        return ma_price.reindex(new_pos.index)
         
     def _send_pos_to_db(self, new_pos):
         self.pos_sender.insert(new_pos)
