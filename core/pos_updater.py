@@ -393,6 +393,7 @@ class PosUpdater:
                 self.log.warning(f'mm_t: {mm_t}')
                 self.log.warning(f'his_pft_t: {his_pft_t}')
                 self.ding.send_text(msg, msg_type='warning')
+                w1 = reindexed_w0
         w1 = filter_series(w1, min_abs_value=min_pos, remove=False)
         return w1
     
