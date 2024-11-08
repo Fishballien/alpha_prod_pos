@@ -21,7 +21,7 @@ from utility.decorator_utils import run_by_thread
 # %% 
 class StrategySignalSender:
     
-    def __init__(self, zmq_address: str, version: str = "3.0"):
+    def __init__(self, zmq_address: str, version: str = "4.0"):
         """
         初始化ZMQ套接字，用于发送策略信号消息，并设置版本号。
         
