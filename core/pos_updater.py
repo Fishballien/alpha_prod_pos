@@ -441,18 +441,20 @@ class PosUpdater:
         interval = timedelta(seconds=parse_time_string(sp))
         start_ma_t = ts - interval * ma_wd
         curr_price = self.cache_mgr['curr_price']
-        ts_price = curr_price.loc[ts]
         ma_price = curr_price.loc[start_ma_t:].mean(axis=0)
         
-        px_chg = (ts_price - ma_price) / ma_price
-        abnormal = px_chg.abs() > check_thres
-        px_chg_abn = px_chg[abnormal]
-        if len(px_chg_abn) > 0:
-            msg = f'可能异常的价格波动: {px_chg_abn}'
-            self.log.warning(msg)
-            px_chg_abn_in_markdown = df_to_markdown(px_chg_abn, show_all=True, columns=['symbol', 'price change'])
-            self.ding.send_markdown("异常价格波动告警，请及时查看是否为真实价格，否则可能导致下单数量错误", 
-                                    px_chg_abn_in_markdown, msg_type='warning')
+        # check
+        if ts in curr_price.index:
+            ts_price = curr_price.loc[ts]
+            px_chg = (ts_price - ma_price) / ma_price
+            abnormal = px_chg.abs() > check_thres
+            px_chg_abn = px_chg[abnormal]
+            if len(px_chg_abn) > 0:
+                msg = f'可能异常的价格波动: {px_chg_abn}'
+                self.log.warning(msg)
+                px_chg_abn_in_markdown = df_to_markdown(px_chg_abn, show_all=True, columns=['symbol', 'price change'])
+                self.ding.send_markdown("异常价格波动告警，请及时查看是否为真实价格，否则可能导致下单数量错误", 
+                                        px_chg_abn_in_markdown, msg_type='warning')
         
         return ma_price.reindex(new_pos.index)
         
