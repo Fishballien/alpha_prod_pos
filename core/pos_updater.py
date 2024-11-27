@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from datetime import timedelta
+from datetime import datetime, timedelta
 import time
 import toml
 import signal
@@ -204,9 +204,18 @@ class PosUpdater:
         self.signal_sender.close()
         
     def reload_exchange_info(self, ts):
+        cooling_off_period = self.params['cooling_off_period']
+        
         exchange_info = load_binance_data(self.exchange, self.exchange_info_dir)
+        today = datetime.now()
+        cooling_delta = timedelta(days=cooling_off_period)
+        ipo_before_thres = today - cooling_delta
         trading_symbols = [symbol_info['symbol'].lower() for symbol_info in exchange_info['symbols']
-                           if symbol_info['status'] == 'TRADING' and symbol_info['symbol'].endswith('USDT')]
+                           if (
+                                   symbol_info['status'] == 'TRADING' 
+                                   and symbol_info['symbol'].endswith('USDT')
+                                   and pd.to_datetime(symbol_info['onboardDate'], unit='ms') < ipo_before_thres
+                               )]
         self.trading_symbols = sorted(trading_symbols)
         self._update_factors_to_fetch_mapping()
         
@@ -379,6 +388,13 @@ class PosUpdater:
         
         reindexed_w0 = w0.reindex(alpha.index, fill_value=0)
         w1, status = self.opt_func(alpha, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L0)
+        self.log.warning(status)
+        if status == 'mis_optimal':
+            self.log.warning(f'w1: {w1}')
+            self.log.warning(f'alpha: {alpha}')
+            self.log.warning(f'reindexed_w0: {reindexed_w0}')
+            self.log.warning(f'mm_t: {mm_t}')
+            self.log.warning(f'his_pft_t: {his_pft_t}')
         if status != "optimal":
             msg = f'Could not find optimal result under to_rate: {to_rate_thresh_L0}, try {to_rate_thresh_L1}.'
             self.log.warning(msg)
