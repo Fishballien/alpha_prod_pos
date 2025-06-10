@@ -22,13 +22,15 @@ import toml
 import signal
 import traceback
 from functools import partial
+import threading
 
 
-from core.database_handler import FactorReader, ModelPredictReader, PositionSender, PositionReader
+from core.database_handler import (FactorReader, ModelPredictReader, PositionSender, PositionReader, StrategyUpdater,
+                                   PremiumIndexReader, FundingRateFetcher)
 from core.task_scheduler import TaskScheduler
 from core.cache_persist_manager import CacheManager, PersistManager
 from core.optimize_weight import future_optimal_weight_lp_cvxpy
-from core.signal_sender import StrategySignalSender
+from core.signal_sender import StrategySignalSender, TwapSignalSender
 from utility.dirutils import load_path_config
 from utility.logutils import FishStyleLogger
 from utility.market import usd, load_binance_data
@@ -56,6 +58,7 @@ class PosUpdater:
         self._init_ding_reporter()
         self._repo_important_params()
         self._load_exchange_info_detail()
+        self._load_exchange_info_lock()
         self._init_task_scheduler()
         self._init_db_module()
         self._init_cache()
@@ -133,9 +136,15 @@ class PosUpdater:
         
     def _repo_important_params(self):
         allow_init_pre_pos = self.params['allow_init_pre_pos']
+        funding_limit_pr = self.params.get('funding_limit')
         # 发送 Markdown 消息
         title = f"策略 {self.stg_name} 已启动"
-        markdown_text = f"1. 请注意：允许在读不到旧仓位时初始化持仓为0的参数`allow_init_pre_pos`的设定值为 `{allow_init_pre_pos}`。"
+        markdown_text = (
+            "请注意：  \n"
+            f"1. 允许在读不到旧仓位时初始化持仓为0的参数 `allow_init_pre_pos` 的设定值为 `{allow_init_pre_pos}`。  \n"
+            f"2. 过滤异常Funding Rate参数为：{funding_limit_pr}。  \n"
+        )
+
     
         self.ding.send_markdown(title=title, markdown_text=markdown_text, msg_type='info')
         
@@ -143,6 +152,9 @@ class PosUpdater:
         self.exchange_info_dir = Path(self.path_config['exchange_info'])
         exchange = self.params['exchange']
         self.exchange = globals()[exchange]
+        
+    def _load_exchange_info_lock(self):
+        self.exchange_info_lock = threading.Lock()
 
     def _init_task_scheduler(self):
         self.task_scheduler = TaskScheduler(log=self.log, repo=self.ding)
@@ -150,25 +162,55 @@ class PosUpdater:
     def _init_db_module(self):
         mysql_name = self.params['mysql_name']
         model_name = self.params['model_name']
+        thunder2_pr = self.params['thunder2']
 
         self.factor_reader = FactorReader(mysql_name, log=self.log)
         self.predict_reader = ModelPredictReader(mysql_name, model_name, log=self.log)
         self.pos_sender = PositionSender(mysql_name, self.stg_name, log=self.log)
         self.pos_reader = PositionReader(mysql_name, self.stg_name, log=self.log)
         
+        thunder2_sql_name = thunder2_pr['sql_name']
+        period = thunder2_pr['period']
+        self.thunder_sender = StrategyUpdater(thunder2_sql_name, period, self.stg_name, log=self.log)
+        
+        self._init_funding_fetcher()
+        
+    def _init_funding_fetcher(self):
+        funding_fetcher_pr = self.params['fetch_funding']
+        funding_db_name = funding_fetcher_pr['db_name']
+        ts_thres_early = funding_fetcher_pr['ts_thres_early']
+        ts_thres_late = funding_fetcher_pr['ts_thres_late']
+        max_attempts = funding_fetcher_pr['max_attempts']
+        retry_interval = funding_fetcher_pr['retry_interval']
+        
+        # 创建 PremiumIndexReader 实例
+        reader = PremiumIndexReader(funding_db_name, log=self.log)
+        
+        # 创建 FundingRateFetcher 实例
+        self.funding_fetcher = FundingRateFetcher(
+            reader=reader,
+            ts_thres_early=ts_thres_early,
+            ts_thres_late=ts_thres_late,
+            max_attempts=max_attempts,
+            retry_interval=retry_interval,
+            log=self.log,
+        )
+        
     def _init_cache(self):
-        cache_list = ['curr_price', 'twap_price', 'pos_his', 'twap_profit', 'fee', 'period_pnl']
+        cache_list = ['curr_price', 'twap_price', 'pos_his', 'twap_profit', 'fee', 'period_pnl', 'est_funding_rate']
         self.cache_mgr = CacheManager(self.cache_dir, cache_lookback=self.cache_lookback, 
                                       cache_list=cache_list, log=self.log)
         
     def _init_persist(self):
-        persist_list = ['alpha', 'pos_his', 'twap_profit', 'fee', 'period_pnl']
+        persist_list = ['alpha', 'pos_his', 'twap_profit', 'fee', 'period_pnl', 'est_funding_rate']
         self.persist_mgr = PersistManager(self.persist_dir, persist_list=persist_list, log=self.log)
         
     def _init_signal_sender(self):
         zmq_address = self.params['zmq']['address']
+        twap_zmq_address = self.params['twap_zmq']['address']
         
         self.signal_sender = StrategySignalSender(zmq_address)
+        self.twap_signal_sender = TwapSignalSender(twap_zmq_address)
         
     def _add_tasks(self):
         pos_update_interval = self.params['pos_update_interval']
@@ -179,7 +221,8 @@ class PosUpdater:
         self.task_scheduler.add_task('30 Minute Pos Update', unit, interval, self.update_once)
         # self.task_scheduler.add_task('Daily Pnl', unit, interval, self.calc_daily_pnl)
         self.task_scheduler.add_task('Daily Pnl', 'specific_time', ['00:00'], self.calc_daily_pnl)
-        self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', ['00:05'], 
+        self.task_scheduler.add_task('Reload Exchange Info', 'specific_time', 
+                                     [f"{hour:02d}:08" for hour in range(24)], 
                                      self.reload_exchange_info)
         
     def _set_up_signal_handler(self):
@@ -206,17 +249,19 @@ class PosUpdater:
     def reload_exchange_info(self, ts):
         cooling_off_period = self.params['cooling_off_period']
         
-        exchange_info = load_binance_data(self.exchange, self.exchange_info_dir)
-        today = datetime.now()
-        cooling_delta = timedelta(days=cooling_off_period)
-        ipo_before_thres = today - cooling_delta
-        trading_symbols = [symbol_info['symbol'].lower() for symbol_info in exchange_info['symbols']
-                           if (
-                                   symbol_info['status'] == 'TRADING' 
-                                   and symbol_info['symbol'].endswith('USDT')
-                                   and pd.to_datetime(symbol_info['onboardDate'], unit='ms') < ipo_before_thres
-                               )]
-        self.trading_symbols = sorted(trading_symbols)
+        with self.exchange_info_lock:
+            exchange_info = load_binance_data(self.exchange, self.exchange_info_dir)
+            today = datetime.now()
+            cooling_delta = timedelta(days=cooling_off_period)
+            ipo_before_thres = today - cooling_delta
+            trading_symbols = [symbol_info['symbol'].lower() for symbol_info in exchange_info['symbols']
+                               if (
+                                       symbol_info['status'] == 'TRADING' 
+                                       and symbol_info['symbol'].endswith('USDT')
+                                       and pd.to_datetime(symbol_info['onboardDate'], unit='ms') < ipo_before_thres
+                                       and symbol_info['symbol'] != 'USDCUSDT'
+                                   )]
+            self.trading_symbols = sorted(trading_symbols)
         self._update_factors_to_fetch_mapping()
         
     def _update_factors_to_fetch_mapping(self):
@@ -230,6 +275,7 @@ class PosUpdater:
         try:
             self._fetch_factors(ts)
             pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
+            self._fetch_funding(ts)
             predict_value_matrix = self._fetch_predictions(ts)
             w0 = self._fetch_pre_pos()
             if w0 is None:
@@ -237,15 +283,16 @@ class PosUpdater:
             if predict_value_matrix is not None:
                 # self._log_po_start()
                 alpha = self._get_alpha(predict_value_matrix)
-                mm_t = self._get_momentum_at_t(ts)
-                his_pft_t = self._get_his_profit_at_t(ts)
-                w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t)
+                allow_to_trade_by_funding = self._filter_by_funding(ts)
+                mm_t = self._get_momentum_at_t(ts, allow_to_trade_by_funding)
+                his_pft_t = self._get_his_profit_at_t(ts, allow_to_trade_by_funding)
+                w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t, allow_to_trade_by_funding)
             else:
                 w1 = w0
                 alpha = None
                 self._repo_model_error()
             new_pos = self._update_positions_on_universal_set(w0, w1)
-            self._send_pos_to_zmq(new_pos, ts)
+            self._send_pos_to_zmq_and_db(new_pos, ts)
             self._send_pos_to_db(new_pos)
             # pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
             # self._report_new_pos(new_pos)
@@ -286,6 +333,19 @@ class PosUpdater:
                 self.ding.send_text(msg, msg_type='error')
                 continue
             self.cache_mgr.add_row(cache_name, factor_value_matrix[factor_in_tuple], ts_to_check)
+            
+    def _fetch_funding(self, ts):
+        funding_rates, status = self.funding_fetcher.fetch_funding_rates(
+            timestamp=ts,
+            symbols=self.trading_symbols
+        )
+        if not status['success']:
+            missing_symbols = status["missing_symbols"]
+            len_missing = len(missing_symbols)
+            self.ding.send_text(f'Missing Fundings(total {len_missing}): {missing_symbols}', msg_type='warning')
+        funding_rates = funding_rates['funding_rate'].reindex(self.trading_symbols).fillna(0)
+        print(funding_rates)
+        self.cache_mgr.add_row('est_funding_rate', funding_rates, ts)
     
     def _fetch_predictions(self, ts):
         fetch_params = self.params['fetch_params']
@@ -320,8 +380,10 @@ class PosUpdater:
                 self.log.warning('Failed to Fetch pre_pos!')
                 self.ding.send_text('Failed to Fetch pre_pos!', msg_type='error')
                 
-        if w0 is not None:
-            w0 = filter_series(w0, min_abs_value=min_pos)
+# =============================================================================
+#         if w0 is not None:
+#             w0 = filter_series(w0, min_abs_value=min_pos)
+# =============================================================================
         return w0
     
     def _log_po_start(self):
@@ -337,7 +399,7 @@ class PosUpdater:
         alpha = calculate_weight_from_rank(predict_rank)
         return alpha # TODO: to persist
     
-    def _get_momentum_at_t(self, ts):
+    def _get_momentum_at_t(self, ts, allow_to_trade_by_funding):
         optimizer_params = self.params['optimizer_params']
         momentum_limits = optimizer_params['momentum_limits']
         
@@ -358,11 +420,11 @@ class PosUpdater:
                 self.log.warning(f'Timestamp: {missing_ts} is not in curr_price. Skip momentum calc for {mm_wd}.')
                 continue
             mm_wd_t = (curr_price.loc[ts] / curr_price.loc[pre_t] -1
-                       ).replace([np.inf, -np.inf], np.nan).reindex(self.trading_symbols).fillna(0.0).values
+                       ).replace([np.inf, -np.inf], np.nan).reindex(allow_to_trade_by_funding).fillna(0.0).values
             mm_t[mm_wd] = mm_wd_t
         return mm_t
     
-    def _get_his_profit_at_t(self, ts):
+    def _get_his_profit_at_t(self, ts, allow_to_trade_by_funding):
         optimizer_params = self.params['optimizer_params']
         pf_limits = optimizer_params['pf_limits']
         
@@ -376,18 +438,44 @@ class PosUpdater:
             if len(twap_profit_since) == 0:
                 self.log.warning(f'Found no profit record since {pre_t}. Skip his profit calc for {pf_wd}.')
                 continue
-            pf_wd_t = twap_profit_since.sum(axis=0).reindex(self.trading_symbols).values
+            pf_wd_t = twap_profit_since.sum(axis=0).reindex(allow_to_trade_by_funding).values
             his_pft_t[pf_wd] = pf_wd_t
         return his_pft_t
     
-    def _po_on_tradable(self, w0, alpha, mm_t, his_pft_t): # 对可交易部分组合优化
+    def _filter_by_funding(self, ts):  
+        funding_limit_pr = self.params.get('funding_limit')
+        if funding_limit_pr is None:
+            return self.trading_symbols
+        funding_abs_limit = funding_limit_pr['funding_abs_limit']
+        funding_cooldown = funding_limit_pr['funding_cooldown']
+        
+        est_funding_rate = self.cache_mgr['est_funding_rate']
+        funding_invalid = est_funding_rate.abs() > funding_abs_limit
+        
+        if funding_cooldown is not None:
+            rolling_below_threshold = funding_invalid.rolling(window=funding_cooldown, min_periods=1).mean()
+            final_mask = rolling_below_threshold != 0
+        else:
+            final_mask = funding_invalid
+        lastest_final_mask = final_mask.loc[ts].reindex(index=self.trading_symbols).fillna(False)
+        allow_to_trade_by_funding =  lastest_final_mask[~lastest_final_mask].index.tolist()
+        banned_by_funding = lastest_final_mask[lastest_final_mask].index.tolist()
+        
+        msg = f'Banned From Trading By Funding: {banned_by_funding}'
+        self.log.info(msg)
+        self.ding.send_text(msg, msg_type='info')
+        
+        return allow_to_trade_by_funding
+    
+    def _po_on_tradable(self, w0, alpha, mm_t, his_pft_t, allow_to_trade_by_funding): # 对可交易部分组合优化
         optimizer_params = self.params['optimizer_params']
         to_rate_thresh_L0 = optimizer_params['to_rate_thresh_L0']
         to_rate_thresh_L1 = optimizer_params['to_rate_thresh_L1']
         min_pos = self.params['min_pos']
         
-        reindexed_w0 = w0.reindex(alpha.index, fill_value=0)
-        w1, status = self.opt_func(alpha, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L0)
+        alpha_filtered = alpha.reindex(allow_to_trade_by_funding)
+        reindexed_w0 = w0.reindex(alpha_filtered.index, fill_value=0)
+        w1, status = self.opt_func(alpha_filtered, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L0)
         self.log.warning(status)
         if status == 'mis_optimal':
             self.log.warning(f'w1: {w1}')
@@ -399,7 +487,7 @@ class PosUpdater:
             msg = f'Could not find optimal result under to_rate: {to_rate_thresh_L0}, try {to_rate_thresh_L1}.'
             self.log.warning(msg)
             self.ding.send_text(msg, msg_type='warning')
-            w1, status = self.opt_func(alpha, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L1)
+            w1, status = self.opt_func(alpha_filtered, reindexed_w0, mm_t, his_pft_t, to_rate_thresh_L1)
             if status != "optimal":
                 msg = (f'Still could not find optimal result under to_rate: {to_rate_thresh_L1}, '
                        'remain previous pos.')
@@ -410,7 +498,7 @@ class PosUpdater:
                 self.log.warning(f'his_pft_t: {his_pft_t}')
                 self.ding.send_text(msg, msg_type='warning')
                 w1 = reindexed_w0
-        w1 = filter_series(w1, min_abs_value=min_pos, remove=False)
+        # w1 = filter_series(w1, min_abs_value=min_pos, remove=False)
         return w1
     
     def _repo_model_error(self):
@@ -434,11 +522,9 @@ class PosUpdater:
         
         return new_pos
     
-    def _send_pos_to_zmq(self, new_pos, ts):
+    def _send_pos_to_zmq_and_db(self, new_pos, ts):
         zmq_params = self.params['zmq']
-        strategy_name = zmq_params['strategy_name']
-        exchange = zmq_params['exchange']
-        symbol_type = zmq_params['symbol_type']
+        twap_zmq_params = self.params['twap_zmq']
         capital = self.params['capital']
 
         ma_price_reindexed = self._get_ma_price(new_pos, ts)
@@ -446,7 +532,26 @@ class PosUpdater:
         
         for symbol, pos in new_pos_in_coin.items():
             symbol_upper = symbol.upper()  # 转为大写
-            self.signal_sender.send_message(strategy_name, exchange, symbol_type, symbol_upper, str(pos))
+            self.signal_sender.send_message(
+                zmq_params['strategy_name'], 
+                zmq_params['exchange'],
+                zmq_params['symbol_type'], 
+                symbol_upper, str(pos)
+                )
+            self.twap_signal_sender.send_message(
+                twap_zmq_params['strategy_name'], 
+                twap_zmq_params['exchange'],
+                twap_zmq_params['symbol_type'], 
+                symbol_upper, str(pos),
+                twap_zmq_params['mode']
+                )
+        
+        with self.exchange_info_lock:
+            new_pos_send_to_thunder = new_pos_in_coin.reindex(self.trading_symbols + ['usdcusdt']).fillna(0)
+        try:
+            self.thunder_sender.update_signals_and_status(ts, new_pos_send_to_thunder)
+        except:
+            traceback.print_exc()
             
     def _get_ma_price(self, new_pos, ts):
         sp = self.params['sp']
@@ -534,7 +639,7 @@ class PosUpdater:
         pos_change_to_repo = self.params['pos_change_to_repo']
 
         ## pos diff
-        reindexed_w0 = w0.reindex(new_pos.index)
+        reindexed_w0 = w0.reindex(new_pos.index, fill_value=0)
         pos_diff = new_pos - reindexed_w0
         pos_diff_filtered = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
         pos_diff_to_repo = np.round(pos_diff_filtered, decimals=4)
@@ -592,6 +697,7 @@ class PosUpdater:
         else:
             self.log.warning(f'Failed to calc fee till {ts}. Skip saving persist: fee.')
         self.persist_mgr.add_row('period_pnl', period_pnl, ts)
+        self.persist_mgr.add_row('est_funding_rate', self.cache_mgr['est_funding_rate'].loc[ts], ts)
         self.persist_mgr.save(ts)
         
     def calc_daily_pnl(self, ts):

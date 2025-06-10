@@ -58,6 +58,11 @@ def align_index(df_1, df_2):
     return df_1.loc[inner_index, :], df_2.loc[inner_index, :]
 
 
+def align_columns_with_main(main_col, sub_df):
+    sub_aligned = sub_df.reindex(columns=main_col)
+    return sub_aligned
+
+
 # %% dict
 def is_empty_dict(d):
     # 如果当前字典为空

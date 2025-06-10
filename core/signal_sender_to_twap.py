@@ -12,8 +12,8 @@ emoji: 🔔 ⏳ ⏰ 🔒 🔓 🛑 🚫 ❗ ❓ ❌ ⭕ 🚀 🔥 💧 💡 🎵
 
 """
 # %% imports
-import zmq
 import time
+import zmq
 
 
 from utility.decorator_utils import run_by_thread
@@ -37,7 +37,7 @@ class StrategySignalSender:
         self.socket.connect(self.zmq_address)
         self.socket.setsockopt(zmq.SNDHWM, 0)  # 设置高水位线为0，防止消息丢失
     
-    # @run_by_thread(daemon=False)
+    @run_by_thread(daemon=False)
     def send_message(self, strategy_name: str, exchange: str, symbol_type: str, symbol: str, position: str):
         """
         发送策略信号消息。
@@ -57,7 +57,8 @@ class StrategySignalSender:
         self.socket.close()
         self.context.term()
         
-        
+
+# %%
 class TwapSignalSender:
     
     def __init__(self, zmq_address: str, version: str = "3.0"):
@@ -75,7 +76,7 @@ class TwapSignalSender:
         self.socket.connect(self.zmq_address)
         self.socket.setsockopt(zmq.SNDHWM, 0)  # 设置高水位线为0，防止消息丢失
 
-    # @run_by_thread(daemon=False)
+    
     def send_message(self, strategy_name: str, exchange: str, symbol_type: str, symbol: str, position: str, split_mode: str):
         """
         发送策略信号消息。
@@ -97,34 +98,22 @@ class TwapSignalSender:
         """关闭ZMQ套接字和上下文。"""
         self.socket.close()
         self.context.term()
-        
-
-# =============================================================================
-# def a():
-#     sender = StrategySignalSender("tcp://172.16.20.247:10086", version="3.0")
-#     twap_sender = TwapSignalSender("tcp://172.16.30.192:10086")
-#     
-#     # 发送示例消息
-#     sender.send_message("TMP_BN_STRATEGY", "BN", "PERPETUAL", "BTCUSDT", "0.01")
-#     # sender.send_message("TMP_OK_STRATEGY", "OK", "SPOT", "BTC-USDT", "0.01")
-#     twap_sender.send_message("ZXT_TEST", "BN", "FUP", "BTCUSDT", "0.02", "TWAP") 
-# =============================================================================
 
 
 # %% 使用示例
 if __name__ == "__main__":
-    pass
-# =============================================================================
-#     sender = StrategySignalSender("tcp://172.16.20.247:10086", version="3.0")
-#     twap_sender = TwapSignalSender("tcp://172.16.30.192:10086")
-#     
-#     # 发送示例消息
-#     sender.send_message("TMP_BN_STRATEGY", "BN", "PERPETUAL", "BTCUSDT", "0.01")
-#     # sender.send_message("TMP_OK_STRATEGY", "OK", "SPOT", "BTC-USDT", "0.01")
-#     twap_sender.send_message("ZXT_TEST", "BN", "FUP", "BTCUSDT", "0.02", "TWAP") 
-#     
-#     sender.close()
-# =============================================================================
+    sender = TwapSignalSender("tcp://172.16.30.192:10086")
+    sender.send_message("ZXT_TEST", "BN", "FUP", "BTCUSDT", "0.02", "TWAP")    
 
-    # a()
+    # {time_start},{self.version},{strategy_name},{exchange},{symbol_type},{symbol},{position},{split_mode},{is_init}
+    # {time_start} 不用输入
+    # """
+    # 1739434857544433,3.0,TMP_BN_STRATEGY000,BN,SPOT,BTCUSDT,0.02,TWAP,True
+    # 1739434858545633,3.0,TMP_BN_STRATEGY000,OK,PERPETUAL,BTCUSDT,0.02,TWAP,True
+    # 1739434859546678,3.0,TMP_BN_STRATEGY000,OK,SPOT,BTCUSDT,0.02,TWAP,True
+    # 1739434860547661,3.0,TMP_BN_STRATEGY000,BN,PERPETUAL,BTCUSDT,0.05,TWAP,False
+    # """
+    sender.close()
+
+
 

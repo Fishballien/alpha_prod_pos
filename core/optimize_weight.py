@@ -50,6 +50,7 @@ def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh,
         alpha_r = pd.Series(alpha)
         alpha_r = alpha_r.rank(pct=True).sub(0.5 / alpha_r.count()).replace([np.inf, -np.inf], np.nan) - 0.5
         max_wgt = (alpha_r / np.abs(alpha_r).sum()).max() * max_multi # org
+        
     constraints += [w <= max_wgt, w >= -max_wgt]
 
     # 动量约束
@@ -84,6 +85,15 @@ def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh,
     except:
         return w0, 'error'
     w1 = w.value
+    
+    if problem.status == 'optimal' and (# 求解失败但误判：
+            w1 is None
+            or np.max(np.abs(w1)) > max_wgt + 0.01
+            or np.sum(np.abs(w1)) < 0.5
+            ): 
+        print('max', np.max(np.abs(w1)))
+        print('sum', np.sum(np.abs(w1)))
+        return w1, 'mis_optimal'
 
     # 定义和求解问题
     try:
