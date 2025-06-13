@@ -58,34 +58,30 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
         self._init_dir()
         self._init_log()
         self._load_params()
-        self._format_params()
+        self._format_params() 
         self._init_window_mapping()
         self._init_opt_func()
         self._init_ding_reporter()
+        
+        # 验证模式下的初始化流程
+        self._init_backtest_params()
         self._repo_important_params()
         self._load_exchange_info_detail()
         self._load_exchange_info_lock()
-        self._init_task_scheduler()
         
         # 验证模式下只初始化数据读取相关的模块，跳过发送模块
         self._init_db_module_for_validation()
-        
         self._init_cache()
         self._init_persist()
         
-        # 验证模式下不初始化信号发送
-        # self._init_signal_sender()
-        
-        # 新增：初始化回测相关参数
-        self._init_backtest_params()
-        
+        # 加载交易币种信息
         self.reload_exchange_info(0)
         
-        # 新增：尝试从回测初始化
-        self._attempt_backtest_initialization()
-        
-        self._add_tasks()
-        self._set_up_signal_handler()
+        # 直接运行验证，不添加定时任务
+        if self.enable_validation:
+            self._run_validation()
+        else:
+            self.log.info("Validation disabled in config")
     
     def _init_db_module_for_validation(self):
         """验证模式下的数据库模块初始化，只初始化读取相关的模块"""
@@ -141,43 +137,93 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             if self.validation_end_time:
                 self.validation_end_time = pd.to_datetime(self.validation_end_time)
                 
+            # Alpha数据路径（可选）
+            self.alpha_path = self.validation_params.get('alpha_path')
+            if self.alpha_path:
+                self.log.info(f"Using alpha data from file: {self.alpha_path}")
+                self._preload_alpha_data()
+            else:
+                self.log.info("Using alpha data from persist")
+                
             self.log.info(f"Validation period: {self.validation_start_time} to {self.validation_end_time}")
         else:
             self.log.info("Validation mode disabled")
     
-    def _add_tasks(self):
-        """重写任务添加，如果是验证模式则直接运行验证而不是添加定时任务"""
-        if self.enable_validation:
-            self.log.info("Starting validation process...")
-            self._run_validation()
-        else:
-            # 非验证模式时调用父类方法
-            super()._add_tasks()
+    def _preload_alpha_data(self):
+        """预加载alpha数据（如果指定了alpha_path）"""
+        try:
+            if not self.alpha_path:
+                return
+                
+            self.log.info(f"Loading alpha data from: {self.alpha_path}")
+            self.alpha_data = pd.read_parquet(self.alpha_path)
+            
+            # 过滤到验证时间范围
+            self.alpha_data = self.alpha_data.loc[self.validation_start_time:self.validation_end_time]
+            
+            self.log.success(f"Loaded alpha data: {len(self.alpha_data)} rows, {len(self.alpha_data.columns)} symbols")
+            
+        except Exception as e:
+            self.log.exception(f"Error loading alpha data from {self.alpha_path}: {e}")
+            self.alpha_data = None
     
     def _run_validation(self):
         """运行验证流程"""
         try:
+            self.log.info("Starting validation process...")
+            
             # 1. 加载回测仓位作为对比基准
             comparison_positions = self._load_comparison_positions()
             if comparison_positions is None:
                 self.log.error("Cannot load backtest positions for comparison, validation aborted")
                 return
             
-            # 2. 准备验证回测位置（使用validation_start_time作为回测最后时间）
-            self._prepare_validation_backtest()
+            # 2. 找到validation_start_time的对应回测仓位作为初始仓位
+            start_position = self._get_start_position(comparison_positions)
+            if start_position is None:
+                self.log.error("Cannot find start position for validation, validation aborted")
+                return
             
-            # 3. 执行历史回放
-            self._execute_validation_rollforward()
+            # 3. 预加载历史数据
+            self.log.info("Preloading historical data...")
+            self._preload_historical_price_data()
+            self._preload_backtest_profits()
+            self._preload_other_cache_data()
             
-            # 4. 对比结果
+            # 4. 生成验证时间戳序列
+            validation_timestamps = self._generate_validation_timestamps()
+            self.log.info(f"Generated {len(validation_timestamps)} timestamps for validation")
+            
+            # 5. 执行历史回放（从start_position开始）
+            self._execute_validation_rollforward(start_position, validation_timestamps)
+            
+            # 6. 对比结果
             self._compare_results(comparison_positions)
             
-            # 5. 生成报告
+            # 7. 生成报告
             self._generate_validation_report()
+            
+            self.log.success("Validation completed successfully")
+            
+            # 输出调试数据保存总结
+            self._summarize_debug_data_saving()
             
         except Exception as e:
             self.log.exception(f"Error in validation: {e}")
             self.ding.send_text(f"Validation failed: {str(e)}", msg_type='error')
+    
+    def _summarize_debug_data_saving(self):
+        """总结调试数据保存情况"""
+        try:
+            if hasattr(self, '_debug_save_count'):
+                debug_dir = self.persist_dir / 'debug_data'
+                self.log.success(f"Total debug data files saved: {self._debug_save_count}")
+                self.log.info(f"Debug data location: {debug_dir}")
+                
+                # 发送钉钉通知
+                self.ding.send_text(f"验证完成，已保存 {self._debug_save_count} 个调试数据文件", msg_type='info')
+        except Exception as e:
+            self.log.warning(f"Error summarizing debug data: {e}")
     
     def _load_comparison_positions(self):
         """加载对比用的回测仓位数据"""
@@ -206,45 +252,23 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             self.log.exception(f"Error loading backtest positions for comparison: {e}")
             return None
     
-    def _prepare_validation_backtest(self):
-        """准备验证用的回测数据"""
-        # 创建模拟的回测仓位，假设在validation_start_time有一个初始仓位
+    def _get_start_position(self, comparison_positions):
+        """从回测仓位中获取validation_start_time对应的仓位作为起始仓位"""
         try:
-            # 从persist获取validation_start_time的历史仓位作为起始点
-            start_pos = self.persist_mgr.get_row('pos_his', self.validation_start_time)
-            if start_pos is None:
-                # 如果没有历史仓位，创建零仓位
-                start_pos = pd.Series(data=[0]*len(self.trading_symbols), index=self.trading_symbols)
-                self.log.warning(f"No historical position found at {self.validation_start_time}, using zero position")
+            if self.validation_start_time not in comparison_positions.index:
+                self.log.error(f"Start time {self.validation_start_time} not found in backtest positions")
+                return None
             
-            # 创建模拟的回测仓位DataFrame
-            self.mock_backtest_positions = pd.DataFrame([start_pos], index=[self.validation_start_time])
-            self.log.info(f"Prepared validation backtest starting position at {self.validation_start_time}")
+            start_position = comparison_positions.loc[self.validation_start_time]
+            self.log.info(f"Found start position at {self.validation_start_time}")
+            return start_position
             
         except Exception as e:
-            self.log.exception(f"Error preparing validation backtest: {e}")
-            # 创建零仓位作为fallback
-            start_pos = pd.Series(data=[0]*len(self.trading_symbols), index=self.trading_symbols)
-            self.mock_backtest_positions = pd.DataFrame([start_pos], index=[self.validation_start_time])
-    
-    def _execute_validation_rollforward(self):
-        """执行验证回放"""
-        try:
-            # 生成验证时间戳
-            validation_timestamps = self._generate_validation_timestamps()
-            self.log.info(f"Generated {len(validation_timestamps)} timestamps for validation")
-            
-            # 使用模拟的回测仓位开始滚动
-            self._execute_rollforward(self.mock_backtest_positions, validation_timestamps)
-            
-            # 保存验证期间的所有仓位
-            self._save_validation_positions()
-            
-        except Exception as e:
-            self.log.exception(f"Error in validation rollforward: {e}")
+            self.log.exception(f"Error getting start position: {e}")
+            return None
     
     def _generate_validation_timestamps(self):
-        """生成验证时间戳序列"""
+        """生成验证时间戳序列（不包括start_time，从下一个时间点开始）"""
         sp = self.params['sp']
         interval = timedelta(seconds=parse_time_string(sp))
         
@@ -257,39 +281,220 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
         
         return timestamps
     
-    def _rollforward_update_once(self, ts, current_pos):
-        """重写单次更新，保存每次的仓位用于验证"""
+    def _execute_validation_rollforward(self, start_position, validation_timestamps):
+        """执行验证回放"""
         try:
-            # 调用父类方法进行更新
-            new_pos = super()._rollforward_update_once(ts, current_pos)
+            # 将起始仓位添加到cache
+            self.cache_mgr.add_row('pos_his', start_position, self.validation_start_time)
+            self.log.info(f"Initialized cache with start position at {self.validation_start_time}")
             
-            # 保存仓位到验证结果中
-            if new_pos is not None:
-                self.validation_positions[ts] = new_pos.copy()
+            # 初始化当前仓位
+            current_pos = start_position
+            
+            # 逐个时间戳进行回放
+            successful_updates = 0
+            
+            for i, ts in enumerate(validation_timestamps):
+                try:
+                    if (i + 1) % 100 == 0 or i == len(validation_timestamps) - 1:
+                        self.log.info(f"Validating {i+1}/{len(validation_timestamps)}: {ts}")
+                    
+                    # 执行单次更新
+                    new_pos = self._validation_update_once(ts, current_pos)
+                    if new_pos is not None:
+                        current_pos = new_pos
+                        successful_updates += 1
+                        # 保存仓位到验证结果中
+                        self.validation_positions[ts] = new_pos.copy()
+                    
+                except Exception as e:
+                    self.log.exception(f"Error during validation at {ts}: {e}")
+                    # 继续使用上一个仓位
+                    continue
+            
+            self.log.success(f"Validation rollforward completed: {successful_updates}/{len(validation_timestamps)} successful updates")
+            
+        except Exception as e:
+            self.log.exception(f"Error in validation rollforward: {e}")
+    
+    def _validation_update_once(self, ts, current_pos):
+        """验证模式的单次更新（基于历史数据的纯模拟）"""
+        try:
+            # 1. 从persist读取历史alpha
+            alpha = self._fetch_historical_alpha(ts)
+            if alpha is None:
+                self.log.warning(f"No alpha found for {ts}, keeping current position")
+                return current_pos
+            
+            # 2. 重建必要的cache数据（从persist）
+            self._rebuild_cache_for_timestamp(ts)
+            
+            # 3. 确定当时可交易的symbols（基于当时的数据可用性）
+            available_symbols = self._get_available_symbols_at_timestamp(ts, alpha)
+            
+            # 4. 获取funding过滤
+            try:
+                allow_to_trade_by_funding = self._filter_by_funding_historical(ts, available_symbols)
+            except Exception as e:
+                self.log.warning(f"Error in funding filter at {ts}: {e}, using available symbols")
+                allow_to_trade_by_funding = available_symbols
+            
+            # 5. 计算momentum和历史收益
+            try:
+                mm_t = self._get_momentum_at_t(ts, allow_to_trade_by_funding)
+                his_pft_t = self._get_his_profit_at_t(ts, allow_to_trade_by_funding)
+            except Exception as e:
+                self.log.warning(f"Error calculating momentum/profit at {ts}: {e}, using empty dict")
+                mm_t = {}
+                his_pft_t = {}
+            
+            # 6. 保存调试数据到pickle
+            self._save_debug_data(ts, {
+                'available_symbols': available_symbols,
+                'mm_t': mm_t,
+                'his_pft_t': his_pft_t,
+                'current_pos': current_pos.copy() if hasattr(current_pos, 'copy') else current_pos,
+                'alpha': alpha.copy() if hasattr(alpha, 'copy') else alpha,
+                'allow_to_trade_by_funding': allow_to_trade_by_funding
+            })
+            
+            # 7. 组合优化
+            w1 = self._po_on_tradable(current_pos, alpha, mm_t, his_pft_t, allow_to_trade_by_funding)
+            
+            # 8. 更新到全集
+            new_pos = self._update_positions_on_universal_set(current_pos, w1)
+            
+            # 9. 添加新仓位到cache（用于后续计算momentum和pft）
+            self.cache_mgr.add_row('pos_his', new_pos, ts)
             
             return new_pos
             
         except Exception as e:
-            self.log.warning(f"Error in validation update at {ts}: {e}")
+            self.log.warning(f"Error in validation_update_once at {ts}: {e}")
             return current_pos
     
-    def _save_validation_positions(self):
-        """保存验证期间的仓位"""
+    def _save_debug_data(self, ts, debug_data):
+        """保存调试数据到pickle文件"""
         try:
-            if not self.validation_positions:
-                self.log.warning("No validation positions to save")
-                return
+            import pickle
             
-            # 转换为DataFrame
-            validation_df = pd.DataFrame.from_dict(self.validation_positions, orient='index')
+            # 创建调试数据目录
+            debug_dir = self.persist_dir / 'debug_data'
+            debug_dir.mkdir(parents=True, exist_ok=True)
             
-            # 保存到文件
-            save_path = self.persist_dir / f"validation_positions_{self.stg_name}.parquet"
-            validation_df.to_parquet(save_path)
-            self.log.success(f"Saved validation positions to {save_path}")
+            # 生成文件名（基于时间戳）
+            ts_str = ts.strftime('%Y%m%d_%H%M%S')
+            debug_file = debug_dir / f"debug_data_{ts_str}.pkl"
+            
+            # 添加时间戳到调试数据中
+            debug_data['timestamp'] = ts
+            
+            # 保存到pickle文件
+            with open(debug_file, 'wb') as f:
+                pickle.dump(debug_data, f)
+            
+            # 每保存50个文件输出一次日志，避免日志过多
+            if not hasattr(self, '_debug_save_count'):
+                self._debug_save_count = 0
+            self._debug_save_count += 1
+            
+            if self._debug_save_count % 50 == 0:
+                self.log.info(f"Saved {self._debug_save_count} debug data files to {debug_dir}")
+                
+        except Exception as e:
+            self.log.warning(f"Error saving debug data for {ts}: {e}")
+    
+    def _get_available_symbols_at_timestamp(self, ts, alpha):
+        """获取在指定时间戳下实际可用的symbols（alpha和curr_price都有数据）"""
+        try:
+            available_symbols = []
+            
+            # 检查alpha中有数据的symbols
+            alpha_symbols = set(alpha.dropna().index) if alpha is not None else set()
+            
+            # 检查curr_price中有数据的symbols
+            curr_price_symbols = set()
+            curr_price = self.cache_mgr['curr_price']
+            if ts in curr_price.index:
+                curr_price_at_ts = curr_price.loc[ts].dropna()
+                curr_price_symbols = set(curr_price_at_ts.index)
+            
+            # 取交集：既有alpha又有curr_price的symbols
+            available_symbols = list(alpha_symbols.intersection(curr_price_symbols))
+            
+            if len(available_symbols) == 0:
+                self.log.warning(f"No available symbols at {ts}, using alpha symbols as fallback")
+                available_symbols = list(alpha_symbols)
+            
+            return available_symbols
             
         except Exception as e:
-            self.log.exception(f"Error saving validation positions: {e}")
+            self.log.warning(f"Error getting available symbols at {ts}: {e}")
+            # 如果出错，返回alpha中有数据的symbols作为fallback
+            if alpha is not None:
+                return list(alpha.dropna().index)
+            return []
+    
+    def _fetch_historical_alpha(self, ts):
+        """从persist或指定文件获取历史alpha"""
+        try:
+            # 如果指定了alpha_path，从预加载的数据中获取
+            if hasattr(self, 'alpha_data') and self.alpha_data is not None:
+                if ts in self.alpha_data.index:
+                    return self.alpha_data.loc[ts]
+                else:
+                    return None
+            
+            # 否则从persist获取
+            return self.persist_mgr.get_row('alpha', ts)
+            
+        except Exception as e:
+            return None
+    
+    def _rebuild_cache_for_timestamp(self, ts):
+        """为特定时间戳重建cache数据"""
+        # 从persist读取必要的历史数据到cache
+        data_to_rebuild = ['curr_price', 'twap_price', 'est_funding_rate', 'twap_profit', 'fee']
+        
+        for data_name in data_to_rebuild:
+            try:
+                data = self.persist_mgr.get_row(data_name, ts)
+                if data is not None:
+                    self.cache_mgr.add_row(data_name, data, ts)
+            except Exception as e:
+                # 某些数据可能不存在，继续
+                continue
+    
+    def _filter_by_funding_historical(self, ts, available_symbols):
+        """历史模式的funding过滤（基于当时可用的symbols）"""
+        funding_limit_pr = self.params.get('funding_limit')
+        if funding_limit_pr is None:
+            return available_symbols
+        
+        try:
+            est_funding_rate = self.cache_mgr['est_funding_rate']
+            if ts not in est_funding_rate.index:
+                return available_symbols
+                
+            funding_abs_limit = funding_limit_pr['funding_abs_limit']
+            funding_cooldown = funding_limit_pr.get('funding_cooldown')
+            
+            funding_invalid = est_funding_rate.abs() > funding_abs_limit
+            
+            if funding_cooldown is not None:
+                rolling_below_threshold = funding_invalid.rolling(window=funding_cooldown, min_periods=1).mean()
+                final_mask = rolling_below_threshold != 0
+            else:
+                final_mask = funding_invalid
+                
+            latest_final_mask = final_mask.loc[ts].reindex(index=available_symbols).fillna(False)
+            allow_to_trade_by_funding = latest_final_mask[~latest_final_mask].index.tolist()
+            
+            return allow_to_trade_by_funding
+            
+        except Exception as e:
+            self.log.warning(f"Error in historical funding filter: {e}")
+            return available_symbols
     
     def _compare_results(self, comparison_positions):
         """对比验证结果"""
@@ -300,6 +505,16 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             
             # 转换验证仓位为DataFrame
             validation_df = pd.DataFrame.from_dict(self.validation_positions, orient='index')
+            
+            # 保存验证生成的仓位
+            validation_save_path = self.persist_dir / f"validation_generated_positions_{self.stg_name}.parquet"
+            validation_df.to_parquet(validation_save_path)
+            self.log.success(f"Saved validation generated positions to {validation_save_path}")
+            
+            # 保存从回测中截取用于核对的仓位
+            comparison_save_path = self.persist_dir / f"validation_comparison_positions_{self.stg_name}.parquet"
+            comparison_positions.to_parquet(comparison_save_path)
+            self.log.success(f"Saved comparison positions (from backtest) to {comparison_save_path}")
             
             # 对比每个时间点
             comparison_results = []
@@ -338,10 +553,10 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             
             # 保存对比结果
             self.validation_results = comparison_results
-            comparison_df = pd.DataFrame(comparison_results)
             
-            if not comparison_df.empty:
-                save_path = self.persist_dir / f"validation_comparison_{self.stg_name}.parquet"
+            if comparison_results:
+                comparison_df = pd.DataFrame(comparison_results)
+                save_path = self.persist_dir / f"validation_comparison_results_{self.stg_name}.parquet"
                 comparison_df.to_parquet(save_path)
                 self.log.success(f"Saved comparison results to {save_path}")
             
@@ -412,20 +627,185 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
         except Exception as e:
             self.log.exception(f"Error generating validation report: {e}")
     
+    def _preload_historical_price_data(self):
+        """预加载历史价格数据供mmt计算使用（从配置的文件路径直接读取）"""
+        try:
+            # 从验证配置中获取价格数据文件路径
+            curr_price_path = self.validation_params.get('curr_price_path')
+            twap_price_path = self.validation_params.get('twap_price_path')
+            
+            if not curr_price_path or not twap_price_path:
+                self.log.error("curr_price_path and twap_price_path must be specified in validation config")
+                return
+            
+            # 计算需要的时间范围（改为10天回看）
+            preload_start = self.validation_start_time - timedelta(days=10)
+            preload_end = self.validation_end_time
+            
+            self.log.info(f"Preloading price data from {preload_start} to {preload_end}")
+            
+            curr_price_loaded = 0
+            twap_price_loaded = 0
+            
+            # 加载curr_price数据
+            try:
+                self.log.info(f"Loading curr_price from: {curr_price_path}")
+                curr_price_data = pd.read_parquet(curr_price_path)
+                
+                # 过滤时间范围
+                curr_price_filtered = curr_price_data.loc[preload_start:preload_end]
+                
+                # 写入cache
+                for ts in curr_price_filtered.index:
+                    try:
+                        price_data = curr_price_filtered.loc[ts]
+                        self.cache_mgr.add_row('curr_price', price_data, ts)
+                        curr_price_loaded += 1
+                    except Exception:
+                        continue
+                        
+                self.log.success(f"Loaded {curr_price_loaded} curr_price records")
+                
+            except Exception as e:
+                self.log.error(f"Error loading curr_price data: {e}")
+            
+            # 加载twap_price数据
+            try:
+                self.log.info(f"Loading twap_price from: {twap_price_path}")
+                twap_price_data = pd.read_parquet(twap_price_path)
+                
+                # 过滤时间范围
+                twap_price_filtered = twap_price_data.loc[preload_start:preload_end]
+                
+                # 写入cache
+                for ts in twap_price_filtered.index:
+                    try:
+                        price_data = twap_price_filtered.loc[ts]
+                        self.cache_mgr.add_row('twap_price', price_data, ts)
+                        twap_price_loaded += 1
+                    except Exception:
+                        continue
+                        
+                self.log.success(f"Loaded {twap_price_loaded} twap_price records")
+                
+            except Exception as e:
+                self.log.error(f"Error loading twap_price data: {e}")
+            
+            self.log.success(f"Total preloaded: {curr_price_loaded} curr_price and {twap_price_loaded} twap_price records")
+            
+        except Exception as e:
+            self.log.exception(f"Error preloading historical price data: {e}")
+    
+    def _preload_backtest_profits(self):
+        """预加载回测的历史twap_profit数据供hispft计算使用"""
+        try:
+            # 从回测结果文件中读取历史twap_profit数据
+            backtest_result_path = Path(self.backtest_init_params['backtest_result_path'])
+            test_name = self.backtest_init_params['test_name']
+            backtest_name = self.backtest_init_params['backtest_name']
+            name_to_save = f'{test_name}__{backtest_name}'
+            
+            backtest_dir = backtest_result_path / test_name / 'backtest' / backtest_name
+            
+            # 尝试从验证参数中获取twap_list，如果没有则使用默认值
+            twap_names = self.validation_params.get('twap_list', ['twd30_sp30'])
+            self.log.info(f"Using twap_list for profit preloading: {twap_names}")
+            
+            # 使用第一个twap作为主要的twap_profit数据源
+            main_twap = twap_names[0]
+            
+            try:
+                profit_file = backtest_dir / f"profit_{main_twap}_{name_to_save}.parquet"
+                if not profit_file.exists():
+                    self.log.error(f"Backtest twap profit file not found: {profit_file}")
+                    return
+                
+                # 读取回测的twap_profit数据
+                backtest_profits = pd.read_parquet(profit_file)
+                self.log.info(f"Loaded backtest twap_profit data for {main_twap}: {len(backtest_profits)} rows")
+                
+                # 过滤到validation_start_time之前的数据
+                historical_profits = backtest_profits.loc[:self.validation_start_time]
+                
+                if not historical_profits.empty:
+                    # 一次性批量写入cache（直接赋值给cache的DataFrame）
+                    if 'twap_profit' not in self.cache_mgr.cache or self.cache_mgr.cache['twap_profit'].empty:
+                        self.cache_mgr.cache['twap_profit'] = historical_profits.copy()
+                    else:
+                        # 如果cache中已有数据，进行合并
+                        existing_data = self.cache_mgr.cache['twap_profit']
+                        combined_data = pd.concat([existing_data, historical_profits]).sort_index()
+                        # 去重，保留最新的数据
+                        self.cache_mgr.cache['twap_profit'] = combined_data[~combined_data.index.duplicated(keep='last')]
+                    
+                    self.log.success(f"Preloaded {len(historical_profits)} twap_profit records from {main_twap}")
+                else:
+                    self.log.warning(f"No historical profits found before {self.validation_start_time}")
+                    
+            except Exception as e:
+                self.log.error(f"Error loading twap_profit for {main_twap}: {e}")
+            
+        except Exception as e:
+            self.log.exception(f"Error preloading backtest profits: {e}")
+    
+    def _preload_other_cache_data(self):
+        """预加载其他必要的cache数据"""
+        try:
+            # 预加载validation_start_time前后的fee数据（改为10天回看）
+            preload_start = self.validation_start_time - timedelta(days=10)
+            preload_end = self.validation_end_time
+            
+            sp = self.params['sp']
+            interval = timedelta(seconds=parse_time_string(sp))
+            
+            # 生成时间戳
+            current_ts = preload_start
+            fee_loaded = 0
+            
+            while current_ts <= preload_end:
+                try:
+                    fee_data = self.persist_mgr.get_row('fee', current_ts)
+                    if fee_data is not None:
+                        self.cache_mgr.add_row('fee', fee_data, current_ts)
+                        fee_loaded += 1
+                except Exception:
+                    pass
+                current_ts += interval
+            
+            self.log.success(f"Preloaded {fee_loaded} fee records")
+            
+        except Exception as e:
+            self.log.exception(f"Error preloading other cache data: {e}")
+    
     # 重写信号发送方法，验证模式下不发送实际信号
     def _send_pos_to_zmq_and_db(self, new_pos, ts):
         """验证模式下不发送实际交易信号"""
-        self.log.info(f"Validation mode: skipping signal sending for {ts}")
-        return
+        pass
     
     def _send_pos_to_db(self, new_pos):
         """验证模式下不写入数据库"""
-        self.log.info("Validation mode: skipping database write")
-        return
+        pass
 
 
 # 使用示例
 if __name__ == "__main__":
+    # 配置验证参数示例:
+    # 在策略的.toml配置文件中添加以下配置:
+    """
+    [backtest_init]
+    enable = true
+    backtest_result_path = "/path/to/backtest/results"
+    test_name = "your_test_name"
+    backtest_name = "your_backtest_name"
+    max_lookback_days = 7
+
+    [validation]
+    enable = true
+    start_time = "2025-06-05 00:00:00"
+    end_time = "2025-06-08 00:00:00"
+    twap_list = ["twd30_sp30"]
+    """
+    
     stg_name = "your_strategy_name"
     validator = PosUpdaterBacktestValidator(stg_name)
     # 会自动开始验证流程
