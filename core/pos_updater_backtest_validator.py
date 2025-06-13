@@ -157,7 +157,7 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
                 
             self.log.info(f"Loading alpha data from: {self.alpha_path}")
             self.alpha_data = pd.read_parquet(self.alpha_path)
-            
+
             # 过滤到验证时间范围
             self.alpha_data = self.alpha_data.loc[self.validation_start_time:self.validation_end_time]
             
@@ -320,26 +320,35 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
     def _validation_update_once(self, ts, current_pos):
         """验证模式的单次更新（基于历史数据的纯模拟）"""
         try:
-            # 1. 从persist读取历史alpha
-            alpha = self._fetch_historical_alpha(ts)
-            if alpha is None:
+            # 1. 计算上期profit（t-1到t的收益）
+            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t_validation(ts)
+            
+            # 2. 从persist读取历史alpha
+            raw_alpha = self._fetch_historical_alpha(ts)
+            if raw_alpha is None:
                 self.log.warning(f"No alpha found for {ts}, keeping current position")
                 return current_pos
             
-            # 2. 重建必要的cache数据（从persist）
+            # 3. 重建必要的cache数据（从persist）
             self._rebuild_cache_for_timestamp(ts)
             
-            # 3. 确定当时可交易的symbols（基于当时的数据可用性）
-            available_symbols = self._get_available_symbols_at_timestamp(ts, alpha)
+            # 4. 确定当时可交易的symbols（基于当时的数据可用性）
+            available_symbols = self._get_available_symbols_at_timestamp(ts, raw_alpha)
             
-            # 4. 获取funding过滤
+            # 5. 用available_symbols对alpha进行mask处理（关键修改！）
+            masked_alpha = self._mask_alpha_with_available_symbols(raw_alpha, available_symbols)
+            
+            # 6. 对mask后的alpha进行rank和weight处理
+            alpha = self._process_raw_alpha(masked_alpha)
+            
+            # 5. 获取funding过滤
             try:
                 allow_to_trade_by_funding = self._filter_by_funding_historical(ts, available_symbols)
             except Exception as e:
                 self.log.warning(f"Error in funding filter at {ts}: {e}, using available symbols")
                 allow_to_trade_by_funding = available_symbols
             
-            # 5. 计算momentum和历史收益
+            # 6. 计算momentum和历史收益
             try:
                 mm_t = self._get_momentum_at_t(ts, allow_to_trade_by_funding)
                 his_pft_t = self._get_his_profit_at_t(ts, allow_to_trade_by_funding)
@@ -348,30 +357,96 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
                 mm_t = {}
                 his_pft_t = {}
             
-            # 6. 保存调试数据到pickle
+            # 7. 保存调试数据到pickle
             self._save_debug_data(ts, {
                 'available_symbols': available_symbols,
                 'mm_t': mm_t,
                 'his_pft_t': his_pft_t,
                 'current_pos': current_pos.copy() if hasattr(current_pos, 'copy') else current_pos,
                 'alpha': alpha.copy() if hasattr(alpha, 'copy') else alpha,
-                'allow_to_trade_by_funding': allow_to_trade_by_funding
+                'allow_to_trade_by_funding': allow_to_trade_by_funding,
+                'pft_till_t': pft_till_t.copy() if pft_till_t is not None and hasattr(pft_till_t, 'copy') else pft_till_t,
+                'fee_till_t': fee_till_t.copy() if fee_till_t is not None and hasattr(fee_till_t, 'copy') else fee_till_t
             })
             
-            # 7. 组合优化
+            # 8. 组合优化
             w1 = self._po_on_tradable(current_pos, alpha, mm_t, his_pft_t, allow_to_trade_by_funding)
             
-            # 8. 更新到全集
+            # 9. 更新到全集
             new_pos = self._update_positions_on_universal_set(current_pos, w1)
             
-            # 9. 添加新仓位到cache（用于后续计算momentum和pft）
+            # 10. 添加新仓位到cache（用于后续计算momentum和pft）
             self.cache_mgr.add_row('pos_his', new_pos, ts)
             
-            return new_pos
+            # 11. 保存profit到cache供下次使用（关键添加！）
+            if pft_till_t is not None:
+                sp = self.params['sp']
+                interval = timedelta(seconds=parse_time_string(sp))
+                pre_t_1 = ts - interval
+                self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
+            if fee_till_t is not None:
+                sp = self.params['sp']
+                interval = timedelta(seconds=parse_time_string(sp))
+                pre_t_1 = ts - interval
+                self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
             
+            return new_pos
+        
         except Exception as e:
             self.log.warning(f"Error in validation_update_once at {ts}: {e}")
             return current_pos
+        
+    def _calc_profit_t_1_till_t_validation(self, ts):
+        """验证模式下计算t-1至t的收益（与原始pos_updater逻辑一致）"""
+        try:
+            sp = self.params['sp']
+            fee_rate = self.params['fee_rate']
+    
+            interval = timedelta(seconds=parse_time_string(sp))
+            pre_t_1 = ts - interval
+            pre_t_2 = ts - interval * 2
+            
+            # 创建 dataset，将需要提取的行和相应的键存储到字典中
+            dataset = {
+                'close_price_t_1': ('curr_price', ts),
+                'close_price_t_2': ('curr_price', pre_t_1),
+                'twap_price_t_1': ('twap_price', pre_t_1),
+                'w_t_1': ('pos_his', pre_t_1),
+                'w_t_2': ('pos_his', pre_t_2)
+            }
+            
+            # 用于存储提取后的数据
+            extracted_data = {}
+        
+            # 从 dataset 中调取数据
+            for key, (cache_name, index) in dataset.items():
+                try:
+                    extracted_data[key] = self.cache_mgr[cache_name].loc[index]
+                except KeyError:
+                    self.log.debug(f"KeyError: {index} not found in {cache_name} during validation profit calc.")
+                    return None, None  # 如果有 KeyError，直接返回 None
+                    
+            for key in extracted_data:
+                extracted_data[key] = extracted_data[key].reindex(extracted_data['w_t_1'].index)
+        
+            # 直接在后续计算中使用 extracted_data 的值
+            rtn_c2c = extracted_data['close_price_t_1'] / extracted_data['close_price_t_2'] - 1
+            rtn_cw0 = extracted_data['twap_price_t_1'] / extracted_data['close_price_t_2'] - 1
+            rtn_cw1 = extracted_data['close_price_t_1'] / extracted_data['twap_price_t_1'] - 1
+            
+            # 计算最终的收益
+            pft_till_t = calc_profit_before_next_t(extracted_data['w_t_2'], 
+                                                   extracted_data['w_t_1'], 
+                                                   rtn_c2c, rtn_cw0, rtn_cw1)
+            
+            # 计算fee
+            fee_till_t = np.abs(extracted_data['w_t_1'] - extracted_data['w_t_2']) * fee_rate
+            
+            return pft_till_t, fee_till_t
+            
+        except Exception as e:
+            self.log.debug(f"Error calculating profit for validation at {ts}: {e}")
+            return None, None
     
     def _save_debug_data(self, ts, debug_data):
         """保存调试数据到pickle文件"""
@@ -434,22 +509,55 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             if alpha is not None:
                 return list(alpha.dropna().index)
             return []
-    
+        
     def _fetch_historical_alpha(self, ts):
-        """从persist或指定文件获取历史alpha"""
+        """从persist或指定文件获取历史alpha，并进行必要的处理"""
         try:
             # 如果指定了alpha_path，从预加载的数据中获取
             if hasattr(self, 'alpha_data') and self.alpha_data is not None:
                 if ts in self.alpha_data.index:
-                    return self.alpha_data.loc[ts]
+                    raw_alpha = self.alpha_data.loc[ts]
+                    return raw_alpha  # 返回原始数据，在外部进行mask和process
                 else:
                     return None
             
-            # 否则从persist获取
+            # 否则从persist获取（作为fallback）
             return self.persist_mgr.get_row('alpha', ts)
             
         except Exception as e:
             return None
+    
+    def _process_raw_alpha(self, raw_alpha):
+        """处理原始alpha数据，应用与原始pos_updater中_get_alpha相同的逻辑"""
+        try:
+            # 与原始pos_updater中的_get_alpha方法逻辑一致
+            # 1. 计算rank
+            predict_rank = calculate_rank(raw_alpha)
+            # 2. 从rank计算权重
+            alpha = calculate_weight_from_rank(predict_rank)
+            return alpha
+            
+        except Exception as e:
+            self.log.warning(f"Error processing raw alpha: {e}")
+            # 如果处理失败，直接返回原始数据
+            return raw_alpha
+    
+    def _mask_alpha_with_available_symbols(self, raw_alpha, available_symbols):
+        """用available_symbols对alpha进行mask，将不可用的symbols设为NaN"""
+        try:
+            # 创建alpha的副本
+            alpha = raw_alpha.copy()
+            
+            # 将不在available_symbols中的symbols设为NaN
+            mask = ~alpha.index.isin(available_symbols)
+            alpha.loc[mask] = np.nan
+            
+            self.log.debug(f"Masked alpha: {len(alpha.dropna())}/{len(alpha)} symbols available")
+            return alpha
+            
+        except Exception as e:
+            self.log.warning(f"Error masking alpha with available symbols: {e}")
+            return raw_alpha
     
     def _rebuild_cache_for_timestamp(self, ts):
         """为特定时间戳重建cache数据"""
