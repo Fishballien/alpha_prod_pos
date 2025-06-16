@@ -743,10 +743,13 @@ class PosUpdater:
     
     
 # %%
+# 在pos_updater.py文件中添加import
+from core.local_loader import PriceDataPreloader
+
 class PosUpdaterWithBacktest(PosUpdater):
     """
     支持从回测初始化的PosUpdater
-    完整版本，包含所有必要的方法
+    完整版本，包含所有必要的方法，并使用价格数据预加载器优化回滚性能
     """
     
     def __init__(self, stg_name):
@@ -755,6 +758,9 @@ class PosUpdaterWithBacktest(PosUpdater):
         
         # 调用父类初始化
         super().__init__(stg_name)
+        
+        # 初始化价格数据预加载器
+        self.price_preloader = None
         
         if self.use_backtest_init:
             self._attempt_backtest_initialization()
@@ -789,12 +795,12 @@ class PosUpdaterWithBacktest(PosUpdater):
         self._init_backtest_params()
     
     def _attempt_backtest_initialization(self):
-        """尝试从回测初始化（修改版本，添加价格数据预加载）"""
+        """尝试从回测初始化（使用价格数据预加载器优化）"""
         try:
             self.log.info("Attempting backtest initialization...")
             
-            # 1. 预加载历史价格数据（新增！）
-            self._preload_historical_price_data_for_rollforward()
+            # 1. 初始化价格数据预加载器（新增！）
+            self._initialize_price_preloader()
             
             # 2. 预加载历史twap_profit数据到cache
             self._preload_historical_twap_profit()
@@ -812,85 +818,39 @@ class PosUpdaterWithBacktest(PosUpdater):
             self.log.exception("Error during backtest initialization")
             self.ding.send_text(f"Error during backtest initialization: {str(e)}", msg_type='error')
     
-    def _preload_historical_price_data_for_rollforward(self):
-        """预加载历史价格数据供rollforward时的momentum和profit计算使用"""
+    def _initialize_price_preloader(self):
+        """初始化价格数据预加载器"""
         try:
-            self.log.info("Preloading historical price data for rollforward...")
+            self.log.info("Initializing price data preloader...")
             
             # 获取rollforward起始时间
             start_time = self._get_rollforward_start_time()
             if start_time is None:
-                self.log.warning("Cannot determine start time for price data preloading")
+                self.log.warning("Cannot determine start time for price data preloader")
                 return
             
-            # 获取价格数据文件路径（从backtest_init参数中获取）
-            curr_price_path = self.backtest_init_params.get('curr_price_path')
-            twap_price_path = self.backtest_init_params.get('twap_price_path')
+            # 获取回看天数（可配置，默认30天）
+            price_persist_dir = self.backtest_init_params.get('price_persist_dir', '')
+            lookback_days = self.backtest_init_params.get('price_lookback_days', 30)
             
-            if not curr_price_path or not twap_price_path:
-                self.log.error("curr_price_path and twap_price_path must be specified in backtest_init config")
-                return
+            self.log.info(f"Initializing price preloader with start_time: {start_time}, lookback_days: {lookback_days}")
             
-            # 获取回看天数（可配置，默认10天）
-            price_lookback_days = self.backtest_init_params.get('price_lookback_days', 10)
-            preload_start = start_time - timedelta(days=price_lookback_days)
+            # 创建价格数据预加载器
+            self.price_preloader = PriceDataPreloader(
+                persist_dir=price_persist_dir,
+                start_time=start_time, 
+                lookback_days=lookback_days,
+                log=self.log
+            )
             
-            self.log.info(f"Preloading price data from {preload_start} to {start_time} ({price_lookback_days} days lookback)")
-            
-            curr_price_loaded = 0
-            twap_price_loaded = 0
-            
-            # 加载curr_price数据
-            try:
-                self.log.info(f"Loading curr_price from: {curr_price_path}")
-                curr_price_data = pd.read_parquet(curr_price_path)
-                
-                # 过滤时间范围：preload_start 到 start_time（不包含start_time，因为start_time会从DB读取）
-                curr_price_filtered = curr_price_data.loc[preload_start:start_time]
-
-                # 批量写入cache
-                for ts in curr_price_filtered.index:
-                    try:
-                        price_data = curr_price_filtered.loc[ts]
-                        self.cache_mgr.add_row('curr_price', price_data, ts)
-                        curr_price_loaded += 1
-                    except Exception:
-                        continue
-                        
-                self.log.success(f"Loaded {curr_price_loaded} curr_price records")
-                
-            except Exception as e:
-                self.log.error(f"Error loading curr_price data: {e}")
-            
-            # 加载twap_price数据
-            try:
-                self.log.info(f"Loading twap_price from: {twap_price_path}")
-                twap_price_data = pd.read_parquet(twap_price_path)
-                
-                # 过滤时间范围：preload_start 到 start_time（不包含start_time）
-                twap_price_filtered = twap_price_data.loc[preload_start:start_time]
-
-                # 批量写入cache
-                for ts in twap_price_filtered.index:
-                    try:
-                        price_data = twap_price_filtered.loc[ts]
-                        self.cache_mgr.add_row('twap_price', price_data, ts)
-                        twap_price_loaded += 1
-                    except Exception:
-                        continue
-                        
-                self.log.success(f"Loaded {twap_price_loaded} twap_price records")
-                
-            except Exception as e:
-                self.log.error(f"Error loading twap_price data: {e}")
-            
-            self.log.success(f"Price data preloading completed: {curr_price_loaded} curr_price and {twap_price_loaded} twap_price records")
+            self.log.success("Price data preloader initialized successfully")
             
         except Exception as e:
-            self.log.exception(f"Error preloading historical price data for rollforward: {e}")
-            
+            self.log.exception(f"Error initializing price preloader: {e}")
+            self.price_preloader = None
+    
     def _preload_historical_twap_profit(self):
-        """预加载历史twap_profit数据到cache（新增功能1）"""
+        """预加载历史twap_profit数据到cache"""
         try:
             self.log.info("Preloading historical twap_profit data...")
             
@@ -954,7 +914,7 @@ class PosUpdaterWithBacktest(PosUpdater):
             self.log.exception(f"Error preloading historical twap_profit: {e}")
             
     def _get_rollforward_start_time(self):
-        """获取rollforward的起始时间（新增功能2支持）"""
+        """获取rollforward的起始时间"""
         try:
             # 优先使用配置中指定的start_time
             custom_start_time = self.backtest_init_params.get('start_time')
@@ -980,14 +940,14 @@ class PosUpdaterWithBacktest(PosUpdater):
             return None
     
     def _rollforward_from_backtest(self):
-        """从回测位置滚动到当前，返回是否成功（修改支持自定义起始时间）"""
+        """从回测位置滚动到当前，返回是否成功"""
         try:
             # 1. 加载回测仓位
             backtest_positions = self._load_backtest_positions()
             if backtest_positions is None:
                 return False
             
-            # 2. 获取起始时间戳（支持自定义起始时间）
+            # 2. 获取起始时间戳
             start_ts = self._get_rollforward_start_time()
             if start_ts is None:
                 return False
@@ -1093,7 +1053,7 @@ class PosUpdaterWithBacktest(PosUpdater):
         return missing_ratio < 0.2
     
     def _execute_rollforward(self, backtest_positions, start_ts, timestamps):
-        """执行滚动更新（修改支持从指定起始时间开始）"""
+        """执行滚动更新"""
         # 初始化当前仓位为指定起始时间的回测仓位
         current_pos = backtest_positions.loc[start_ts]
         self.log.info(f"Starting rollforward from {len(timestamps)} timestamps, initial position at {start_ts}")
@@ -1126,10 +1086,10 @@ class PosUpdaterWithBacktest(PosUpdater):
         self.log.success(f"Rollforward completed: {successful_updates}/{len(timestamps)} successful updates, final position at {latest_ts}")
     
     def _rollforward_update_once(self, ts, current_pos):
-        """历史模式的单次更新 - 与update_once步骤完全一致"""
+        """历史模式的单次更新 - 使用预加载的价格数据"""
         try:
-            # 1. 获取因子数据（回滚模式：从数据库读取）
-            self._fetch_factors(ts)
+            # 1. 获取因子数据（回滚模式：从预加载器获取价格数据）
+            self._fetch_factors_for_rollforward(ts)
             
             # 2. 计算t-1至t的收益和费用
             pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
@@ -1194,6 +1154,51 @@ class PosUpdaterWithBacktest(PosUpdater):
             error_msg = traceback.format_exc()
             self.ding.send_markdown(f'ROLLFORWARD UPDATE ERROR at {ts}', error_msg, msg_type='error')
             return current_pos
+    
+    def _fetch_factors_for_rollforward(self, ts):
+        """回滚模式的因子获取 - 使用预加载的价格数据"""
+        assist_factors_params = self.params['assist_factors_params']
+        factors = assist_factors_params['factors']
+        delay_fetch = assist_factors_params['delay_fetch']
+        
+        for factor, delay in list(zip(factors, delay_fetch)):
+            delay_in_dt = self.delay_mapping[delay]
+            ts_to_check = ts - delay_in_dt
+            
+            # 根据因子类型选择对应的缓存名称和预加载器方法
+            if factor['factor'].startswith('curr_price'):
+                cache_name = 'curr_price'
+                if self.price_preloader is not None:
+                    # 使用预加载器获取currprice数据
+                    price_data = self.price_preloader.get_currprice_at_time(ts_to_check, self.trading_symbols)
+                    if not price_data.empty:
+                        self.cache_mgr.add_row(cache_name, price_data, ts_to_check)
+                        self.log.debug(f"[ROLLFORWARD] Loaded {cache_name} from preloader at {ts_to_check}")
+                    else:
+                        self.log.warning(f"[ROLLFORWARD] No {cache_name} data found in preloader for {ts_to_check}")
+                else:
+                    self.log.warning(f"[ROLLFORWARD] Price preloader not available, falling back to DB")
+                    # 回退到原有的数据库获取方法
+                    self._fetch_factors(ts)
+                    
+            elif factor['factor'].startswith('twap_30min'):
+                cache_name = 'twap_price'
+                if self.price_preloader is not None:
+                    # 使用预加载器获取twapprice数据
+                    price_data = self.price_preloader.get_twapprice_at_time(ts_to_check, self.trading_symbols)
+                    if not price_data.empty:
+                        self.cache_mgr.add_row(cache_name, price_data, ts_to_check)
+                        self.log.debug(f"[ROLLFORWARD] Loaded {cache_name} from preloader at {ts_to_check}")
+                    else:
+                        self.log.warning(f"[ROLLFORWARD] No {cache_name} data found in preloader for {ts_to_check}")
+                else:
+                    self.log.warning(f"[ROLLFORWARD] Price preloader not available, falling back to DB")
+                    # 回退到原有的数据库获取方法
+                    self._fetch_factors(ts)
+            else:
+                # 对于非价格因子，仍然使用原有的数据库获取方法
+                self.log.debug(f"[ROLLFORWARD] Non-price factor {factor['factor']}, using DB")
+                self._fetch_factors(ts)
     
     def _send_pos_for_rollforward(self, new_pos, ts):
         """回滚模式的仓位发送 - 只记录日志，不实际发送"""

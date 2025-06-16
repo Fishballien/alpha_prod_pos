@@ -3,7 +3,9 @@
 价格数据预加载器 - 用于PosUpdaterWithBacktest回滚优化
 基于PersistenceManager的读取方法实现批量预加载
 """
-
+# %% imports
+import sys
+import os
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -11,9 +13,19 @@ from collections import defaultdict
 import h5py
 from datetime import datetime, timedelta
 
-from utils.timeutils import get_date_based_on_timestamp
+
+# %% add sys path
+file_path = Path(__file__).resolve()
+file_dir = file_path.parents[0]
+project_dir = file_path.parents[1]
+sys.path.append(str(project_dir))
 
 
+# %%
+from utility.timeutils import get_date_based_on_timestamp
+
+
+# %%
 class PriceDataPreloader:
     """
     价格数据预加载器
@@ -191,3 +203,98 @@ class PriceDataPreloader:
         else:
             # 只返回指定symbols的数据
             return latest_data.reindex(symbols)
+        
+
+if __name__ == '__main__':
+    # 测试参数
+    price_persist_dir = '/mnt/Data/xintang/prod/alpha/factors_update/persist/factors_for_portfolio_management_v0'
+    price_lookback_days = 20
+    start_time = "2025-06-07 00:00:00"
+    
+    print("=" * 60)
+    print("PriceDataPreloader 测试")
+    print("=" * 60)
+    
+    # 打印测试参数
+    print("测试参数:")
+    print(f"  price_persist_dir: {price_persist_dir}")
+    print(f"  price_lookback_days: {price_lookback_days}")
+    print(f"  start_time: {start_time}")
+    print()
+    
+    # 检查目录是否存在
+    print("检查数据目录:")
+    if os.path.exists(price_persist_dir):
+        print(f"✓ 目录存在: {price_persist_dir}")
+        files = os.listdir(price_persist_dir)
+        print(f"  文件数量: {len(files)}")
+        if files:
+            print(f"  前几个文件: {files[:3]}")
+    else:
+        print(f"✗ 目录不存在: {price_persist_dir}")
+    print()
+    
+    # 初始化 PriceDataPreloader
+    print("初始化 PriceDataPreloader...")
+    try:
+        preloader = PriceDataPreloader(
+            price_persist_dir=price_persist_dir,
+            price_lookback_days=price_lookback_days,
+            start_time=start_time
+        )
+        print("✓ 初始化成功")
+        
+        # 打印一些基本信息
+        print(f"  类型: {type(preloader)}")
+        print(f"  属性: {dir(preloader)}")
+        
+    except Exception as e:
+        print(f"✗ 初始化失败: {e}")
+        preloader = None
+    print()
+    
+    # 如果初始化成功，尝试加载数据
+    if preloader is not None:
+        print("尝试加载数据...")
+        try:
+            data = preloader.load_data()  # 假设有这个方法
+            print("✓ 数据加载成功")
+            
+            if hasattr(data, 'shape'):
+                print(f"  数据形状: {data.shape}")
+            if hasattr(data, 'columns'):
+                print(f"  列名: {list(data.columns)[:5]}...")  # 只显示前5列
+            if hasattr(data, 'index'):
+                print(f"  索引类型: {type(data.index)}")
+                if len(data.index) > 0:
+                    print(f"  时间范围: {data.index[0]} 到 {data.index[-1]}")
+            
+            # 显示前几行数据
+            if hasattr(data, 'head'):
+                print("  前几行数据:")
+                print(data.head(3))
+                
+        except Exception as e:
+            print(f"✗ 数据加载失败: {e}")
+            data = None
+        print()
+    
+    # 计算预期的时间范围
+    print("时间范围计算:")
+    start_dt = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+    lookback_dt = start_dt - pd.Timedelta(days=price_lookback_days)
+    print(f"  开始时间: {start_dt}")
+    print(f"  回看开始: {lookback_dt}")
+    print(f"  总天数: {price_lookback_days}")
+    print()
+    
+    print("=" * 60)
+    print("测试完成，设置断点查看变量:")
+    print("  preloader - PriceDataPreloader 实例")
+    print("  data - 加载的数据")
+    print("  start_dt - 开始时间")
+    print("  lookback_dt - 回看开始时间")
+    print("=" * 60)
+    
+    # 断点 - 在这里设置断点来检查变量
+    breakpoint()  # 或者用 import pdb; pdb.set_trace()
