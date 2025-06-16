@@ -18,7 +18,7 @@ import numpy as np
 
 
 # %%
-date_ts = '20250605_003000'
+date_ts = '20250606_233000'
 rt_path = f'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/rt/debug_data/debug_data_{date_ts}.pkl'
 bt_path = f'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/bt/debug_data/debug_data_{date_ts}.pkl'
 

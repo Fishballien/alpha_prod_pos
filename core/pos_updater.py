@@ -746,6 +746,7 @@ class PosUpdater:
 class PosUpdaterWithBacktest(PosUpdater):
     """
     支持从回测初始化的PosUpdater
+    完整版本，包含所有必要的方法
     """
     
     def __init__(self, stg_name):
@@ -754,6 +755,9 @@ class PosUpdaterWithBacktest(PosUpdater):
         
         # 调用父类初始化
         super().__init__(stg_name)
+        
+        if self.use_backtest_init:
+            self._attempt_backtest_initialization()
     
     def _pre_init_backtest_params(self, stg_name):
         """在父类初始化前预加载回测参数"""
@@ -779,19 +783,19 @@ class PosUpdaterWithBacktest(PosUpdater):
         else:
             self.log.info("Backtest initialization disabled")
     
-    def _add_tasks(self):
-        """重写添加任务方法，在添加定时任务前尝试回测初始化"""
-        # 在添加定时任务前执行回测初始化
-        if self.use_backtest_init:
-            self._attempt_backtest_initialization()
-        
-        # 调用父类方法添加定时任务
-        super()._add_tasks()
+    def _load_params(self):
+        """重写参数加载，添加回测参数初始化"""
+        super()._load_params()
+        self._init_backtest_params()
     
     def _attempt_backtest_initialization(self):
         """尝试从回测初始化"""
         try:
             self.log.info("Attempting backtest initialization...")
+            
+            # 新增：预加载历史twap_profit数据到cache
+            self._preload_historical_twap_profit()
+            
             success = self._rollforward_from_backtest()
             if success:
                 self.backtest_initialization_completed = True
@@ -804,44 +808,144 @@ class PosUpdaterWithBacktest(PosUpdater):
             self.log.exception("Error during backtest initialization")
             self.ding.send_text(f"Error during backtest initialization: {str(e)}", msg_type='error')
     
+    def _preload_historical_twap_profit(self):
+        """预加载历史twap_profit数据到cache（新增功能1）"""
+        try:
+            self.log.info("Preloading historical twap_profit data...")
+            
+            # 获取起始时间点
+            start_time = self._get_rollforward_start_time()
+            if start_time is None:
+                self.log.warning("Cannot determine start time for twap_profit preloading")
+                return
+            
+            # 计算需要预加载的时间范围（start_time之前的历史数据用于hispft计算）
+            max_lookback_days = self.backtest_init_params.get('max_lookback_days', 30)  # 默认30天
+            preload_start = start_time - timedelta(days=max_lookback_days)
+            
+            self.log.info(f"Preloading twap_profit from {preload_start} to {start_time}")
+            
+            # 从回测结果文件中读取历史twap_profit数据
+            backtest_result_path = Path(self.backtest_init_params['backtest_result_path'])
+            test_name = self.backtest_init_params['test_name']
+            backtest_name = self.backtest_init_params['backtest_name']
+            name_to_save = f'{test_name}__{backtest_name}'
+            
+            backtest_dir = backtest_result_path / test_name / 'backtest' / backtest_name
+            
+            # 获取twap配置（优先使用参数配置，否则使用默认值）
+            twap_names = self.backtest_init_params.get('twap_list', ['twd30_sp30'])
+            main_twap = twap_names[0]  # 使用第一个twap作为主要数据源
+            
+            profit_file = backtest_dir / f"profit_{main_twap}_{name_to_save}.parquet"
+            
+            if not profit_file.exists():
+                self.log.warning(f"Backtest twap profit file not found: {profit_file}")
+                return
+            
+            # 读取回测的twap_profit数据
+            backtest_profits = pd.read_parquet(profit_file)
+            self.log.info(f"Loaded backtest twap_profit data: {len(backtest_profits)} rows")
+            
+            # 过滤到指定时间范围：preload_start 到 start_time（不包含start_time）
+            historical_profits = backtest_profits.loc[preload_start:start_time]
+            if not historical_profits.empty:
+                # 排除start_time本身（因为start_time的profit将在rollforward中重新计算）
+                historical_profits = historical_profits.loc[historical_profits.index < start_time]
+            
+            if not historical_profits.empty:
+                # 批量写入cache
+                loaded_count = 0
+                for ts in historical_profits.index:
+                    try:
+                        profit_data = historical_profits.loc[ts]
+                        self.cache_mgr.add_row('twap_profit', profit_data, ts)
+                        loaded_count += 1
+                    except Exception as e:
+                        self.log.debug(f"Error loading profit at {ts}: {e}")
+                        continue
+                
+                self.log.success(f"Preloaded {loaded_count} historical twap_profit records to cache")
+            else:
+                self.log.warning(f"No historical profits found in range {preload_start} to {start_time}")
+                
+        except Exception as e:
+            self.log.exception(f"Error preloading historical twap_profit: {e}")
+    
+    def _get_rollforward_start_time(self):
+        """获取rollforward的起始时间（新增功能2支持）"""
+        try:
+            # 优先使用配置中指定的start_time
+            custom_start_time = self.backtest_init_params.get('start_time')
+            if custom_start_time:
+                if isinstance(custom_start_time, str):
+                    start_time = pd.to_datetime(custom_start_time)
+                else:
+                    start_time = custom_start_time
+                self.log.info(f"Using custom start time: {start_time}")
+                return start_time
+            
+            # 否则使用回测的最后时间戳（原有逻辑）
+            backtest_positions = self._load_backtest_positions()
+            if backtest_positions is not None:
+                last_time = backtest_positions.index[-1]
+                self.log.info(f"Using backtest last time as start: {last_time}")
+                return last_time
+            
+            return None
+            
+        except Exception as e:
+            self.log.exception(f"Error getting rollforward start time: {e}")
+            return None
+    
     def _rollforward_from_backtest(self):
-        """从回测位置滚动到当前，返回是否成功"""
+        """从回测位置滚动到当前，返回是否成功（修改支持自定义起始时间）"""
         try:
             # 1. 加载回测仓位
             backtest_positions = self._load_backtest_positions()
             if backtest_positions is None:
                 return False
             
-            # 2. 找到最后的回测时间戳
-            last_backtest_ts = backtest_positions.index[-1]
-            current_ts = datetime.now().replace(second=0, microsecond=0)
-            
-            self.log.info(f"Last backtest timestamp: {last_backtest_ts}, Current: {current_ts}")
-            
-            # 3. 检查时间范围是否合理
-            max_lookback = timedelta(days=self.backtest_init_params.get('max_lookback_days', 7))
-            if current_ts - last_backtest_ts > max_lookback:
-                self.log.warning(f"Backtest data too old: {last_backtest_ts}, max lookback: {max_lookback}")
+            # 2. 获取起始时间戳（支持自定义起始时间）
+            start_ts = self._get_rollforward_start_time()
+            if start_ts is None:
                 return False
             
-            # 4. 生成需要滚动的时间戳
-            rollforward_timestamps = self._generate_rollforward_timestamps(last_backtest_ts, current_ts)
+            # 3. 验证起始时间戳在回测数据中存在
+            if start_ts not in backtest_positions.index:
+                self.log.error(f"Start time {start_ts} not found in backtest positions")
+                available_times = backtest_positions.index.tolist()
+                self.log.info(f"Available times in backtest: {available_times[:5]}...{available_times[-5:]}")
+                return False
+            
+            current_ts = datetime.now().replace(second=0, microsecond=0)
+            
+            self.log.info(f"Rollforward start timestamp: {start_ts}, Current: {current_ts}")
+            
+            # 4. 检查时间范围是否合理
+            max_lookback = timedelta(days=self.backtest_init_params.get('max_lookback_days', 7))
+            if current_ts - start_ts > max_lookback:
+                self.log.warning(f"Start time too old: {start_ts}, max lookback: {max_lookback}")
+                return False
+            
+            # 5. 生成需要滚动的时间戳（从start_ts的下一个时间戳开始）
+            rollforward_timestamps = self._generate_rollforward_timestamps(start_ts, current_ts)
             self.log.info(f"Generated {len(rollforward_timestamps)} timestamps for rollforward")
             
             if len(rollforward_timestamps) == 0:
-                self.log.info("No timestamps to rollforward, using last backtest position")
-                # 直接使用最后的回测仓位
-                last_pos = backtest_positions.iloc[-1]
-                self.cache_mgr.add_row('pos_his', last_pos, last_backtest_ts)
+                self.log.info("No timestamps to rollforward, using start position")
+                # 直接使用起始时间戳的回测仓位
+                start_pos = backtest_positions.loc[start_ts]
+                self.cache_mgr.add_row('pos_his', start_pos, start_ts)
                 return True
             
-            # 5. 检查历史数据完整性
+            # 6. 检查历史数据完整性
             if not self._check_historical_data_completeness(rollforward_timestamps):
                 self.log.warning("Historical data incomplete, cannot rollforward")
                 return False
             
-            # 6. 执行滚动更新
-            self._execute_rollforward(backtest_positions, rollforward_timestamps)
+            # 7. 执行滚动更新（从指定的起始位置开始）
+            self._execute_rollforward(backtest_positions, start_ts, rollforward_timestamps)
             
             return True
             
@@ -907,15 +1011,14 @@ class PosUpdaterWithBacktest(PosUpdater):
         # 如果缺失超过20%，认为数据不完整
         return missing_ratio < 0.2
     
-    def _execute_rollforward(self, backtest_positions, timestamps):
-        """执行滚动更新"""
-        # 初始化当前仓位为回测的最后仓位
-        current_pos = backtest_positions.iloc[-1]
-        self.log.info(f"Starting rollforward from {len(timestamps)} timestamps")
+    def _execute_rollforward(self, backtest_positions, start_ts, timestamps):
+        """执行滚动更新（修改支持从指定起始时间开始）"""
+        # 初始化当前仓位为指定起始时间的回测仓位
+        current_pos = backtest_positions.loc[start_ts]
+        self.log.info(f"Starting rollforward from {len(timestamps)} timestamps, initial position at {start_ts}")
         
-        # 将回测最后仓位添加到cache作为起始点
-        last_backtest_ts = backtest_positions.index[-1]
-        self.cache_mgr.add_row('pos_his', current_pos, last_backtest_ts)
+        # 将起始仓位添加到cache作为起始点
+        self.cache_mgr.add_row('pos_his', current_pos, start_ts)
         
         successful_updates = 0
         
@@ -936,7 +1039,7 @@ class PosUpdaterWithBacktest(PosUpdater):
                 continue
         
         # 将最终仓位保存到cache中，作为下次update的起始点
-        latest_ts = timestamps[-1] if timestamps else last_backtest_ts
+        latest_ts = timestamps[-1] if timestamps else start_ts
         self.cache_mgr.add_row('pos_his', current_pos, latest_ts)
         
         self.log.success(f"Rollforward completed: {successful_updates}/{len(timestamps)} successful updates, final position at {latest_ts}")
@@ -968,12 +1071,46 @@ class PosUpdaterWithBacktest(PosUpdater):
             # 7. 添加新仓位到cache（用于后续计算momentum和pft）
             self.cache_mgr.add_row('pos_his', new_pos, ts)
             
-            # 注意：历史滚动不写入persist或数据库，只更新内存状态
+            # 8. 计算并保存当期的twap_profit到persist（新增：只保存新计算的）
+            self._calc_and_save_current_twap_profit(ts)
+            
+            # 注意：历史滚动不写入数据库，只更新内存状态
             return new_pos
             
         except Exception as e:
             self.log.warning(f"Error in rollforward_update_once at {ts}: {e}")
             return current_pos
+    
+    def _calc_and_save_current_twap_profit(self, ts):
+        """计算并保存当前时刻的twap_profit到persist（新增方法）"""
+        try:
+            # 计算t-1至t的收益
+            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
+            
+            if pft_till_t is not None:
+                sp = self.params['sp']
+                interval = timedelta(seconds=parse_time_string(sp))
+                pre_t_1 = ts - interval
+                
+                # 添加到cache（用于后续hispft计算）
+                self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
+                
+                # 保存到persist（只保存新计算的数据点）
+                self.persist_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
+                
+                self.log.debug(f"Saved twap_profit for {pre_t_1}")
+            
+            if fee_till_t is not None:
+                sp = self.params['sp']
+                interval = timedelta(seconds=parse_time_string(sp))
+                pre_t_1 = ts - interval
+                
+                # 添加到cache和persist
+                self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
+                self.persist_mgr.add_row('fee', fee_till_t, pre_t_1)
+                
+        except Exception as e:
+            self.log.debug(f"Error calculating/saving twap_profit at {ts}: {e}")
     
     def _fetch_historical_alpha(self, ts):
         """从persist获取历史alpha"""
@@ -985,7 +1122,7 @@ class PosUpdaterWithBacktest(PosUpdater):
     def _rebuild_cache_for_timestamp(self, ts):
         """为特定时间戳重建cache数据"""
         # 从persist读取必要的历史数据到cache
-        data_to_rebuild = ['curr_price', 'twap_price', 'est_funding_rate', 'twap_profit']
+        data_to_rebuild = ['curr_price', 'twap_price', 'est_funding_rate']
         
         for data_name in data_to_rebuild:
             try:
@@ -1042,10 +1179,3 @@ class PosUpdaterWithBacktest(PosUpdater):
         
         # 否则调用父类方法
         return super()._fetch_pre_pos()
-    
-    # 重写父类的初始化流程，在合适的时机调用回测参数初始化
-    def _load_params(self):
-        """重写参数加载，添加回测参数初始化"""
-        super()._load_params()
-        self._init_backtest_params()
-

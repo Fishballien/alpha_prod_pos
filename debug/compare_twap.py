@@ -14,8 +14,8 @@ emoji: 🔔 ⏳ ⏰ 🔒 🔓 🛑 🚫 ❗ ❓ ❌ ⭕ 🚀 🔥 💧 💡 🎵
 import pandas as pd
 import numpy as np
 
-old_twap_path = 'D:/mnt/Data/Crypto/ProcessedData/updated_twap/twd30_sp30.parquet'
-new_twap_path = 'D:/mnt/Data/Crypto/ProcessedData/updated_twap/debug/twd30_sp30.parquet'
+old_twap_path = 'D:/mnt/Data/Crypto/ProcessedData/updated_twap/curr_price_sp30.parquet'
+new_twap_path = 'D:/mnt/Data/Crypto/ProcessedData/updated_twap/debug/curr_price_sp30.parquet'
 
 old_twap = pd.read_parquet(old_twap_path)
 new_twap = pd.read_parquet(new_twap_path)

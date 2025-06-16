@@ -14,8 +14,8 @@ emoji: 🔔 ⏳ ⏰ 🔒 🔓 🛑 🚫 ❗ ❓ ❌ ⭕ 🚀 🔥 💧 💡 🎵
 import pandas as pd
 import numpy as np
 
-old_twap_path = 'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/rt/pos/pos_merge_agg_250318_double3m_15d_73__to_00125_maxmulti_2_mm_03_pf_001_count_funding.parquet'
-new_twap_path = 'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/bt/pos/pos_merge_agg_250318_double3m_15d_73__to_00125_maxmulti_2_mm_03_pf_001_count_funding.parquet'
+old_twap_path = 'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/bt/pos/pos_merge_agg_250318_double3m_15d_73__to_00125_maxmulti_2_mm_03_pf_001_count_funding.parquet'
+new_twap_path = 'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/bt/pos_new/pos_merge_agg_250318_double3m_15d_73__to_00125_maxmulti_2_mm_03_pf_001_count_funding.parquet'
 
 old_twap = pd.read_parquet(old_twap_path)
 new_twap = pd.read_parquet(new_twap_path)
