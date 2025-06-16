@@ -819,7 +819,7 @@ class PosUpdaterWithBacktest(PosUpdater):
             self.ding.send_text(f"Error during backtest initialization: {str(e)}", msg_type='error')
     
     def _initialize_price_preloader(self):
-        """初始化价格数据预加载器"""
+        """初始化价格数据预加载器 - 使用参数化配置"""
         try:
             self.log.info("Initializing price data preloader...")
             
@@ -833,12 +833,19 @@ class PosUpdaterWithBacktest(PosUpdater):
             price_persist_dir = self.backtest_init_params.get('price_persist_dir', '')
             lookback_days = self.backtest_init_params.get('price_lookback_days', 30)
             
-            self.log.info(f"Initializing price preloader with start_time: {start_time}, lookback_days: {lookback_days}")
+            # 获取因子配置 - 使用与PosUpdater相同的配置
+            assist_factors_params = self.params['assist_factors_params']
+            factors = assist_factors_params['factors']
             
-            # 创建价格数据预加载器
+            self.log.info(f"Initializing price preloader with start_time: {start_time}, lookback_days: {lookback_days}")
+            self.log.info(f"Factors to preload: {[f['factor'] for f in factors]}")
+            
+            # 创建价格数据预加载器 - 使用参数化配置
             self.price_preloader = PriceDataPreloader(
                 persist_dir=price_persist_dir,
-                start_time=start_time, 
+                start_time=start_time,
+                factors=factors,  # 传入因子配置
+                trading_symbols=self.trading_symbols,  # 传入交易标的
                 lookback_days=lookback_days,
                 log=self.log
             )
@@ -1156,7 +1163,7 @@ class PosUpdaterWithBacktest(PosUpdater):
             return current_pos
     
     def _fetch_factors_for_rollforward(self, ts):
-        """回滚模式的因子获取 - 使用预加载的价格数据"""
+        """回滚模式的因子获取 - 使用参数化的预加载数据"""
         assist_factors_params = self.params['assist_factors_params']
         factors = assist_factors_params['factors']
         delay_fetch = assist_factors_params['delay_fetch']
@@ -1165,40 +1172,37 @@ class PosUpdaterWithBacktest(PosUpdater):
             delay_in_dt = self.delay_mapping[delay]
             ts_to_check = ts - delay_in_dt
             
-            # 根据因子类型选择对应的缓存名称和预加载器方法
-            if factor['factor'].startswith('curr_price'):
+            factor_name = factor['factor']
+            
+            # 确定缓存名称 (与PriceDataPreloader逻辑一致)
+            if factor_name.startswith('curr_price'):
                 cache_name = 'curr_price'
-                if self.price_preloader is not None:
-                    # 使用预加载器获取currprice数据
-                    price_data = self.price_preloader.get_currprice_at_time(ts_to_check, self.trading_symbols)
-                    if not price_data.empty:
-                        self.cache_mgr.add_row(cache_name, price_data, ts_to_check)
-                        self.log.debug(f"[ROLLFORWARD] Loaded {cache_name} from preloader at {ts_to_check}")
-                    else:
-                        self.log.warning(f"[ROLLFORWARD] No {cache_name} data found in preloader for {ts_to_check}")
-                else:
-                    self.log.warning(f"[ROLLFORWARD] Price preloader not available, falling back to DB")
-                    # 回退到原有的数据库获取方法
-                    self._fetch_factors(ts)
-                    
-            elif factor['factor'].startswith('twap_30min'):
+            elif factor_name.startswith('twap') or 'twap' in factor_name.lower():
                 cache_name = 'twap_price'
-                if self.price_preloader is not None:
-                    # 使用预加载器获取twapprice数据
-                    price_data = self.price_preloader.get_twapprice_at_time(ts_to_check, self.trading_symbols)
+            else:
+                cache_name = factor_name
+            
+            # 尝试从预加载器获取数据
+            if self.price_preloader is not None:
+                try:
+                    # 使用通用的数据获取方法
+                    price_data = self.price_preloader.get_data_at_time(cache_name, ts_to_check, self.trading_symbols)
                     if not price_data.empty:
                         self.cache_mgr.add_row(cache_name, price_data, ts_to_check)
                         self.log.debug(f"[ROLLFORWARD] Loaded {cache_name} from preloader at {ts_to_check}")
+                        self.log.debug(f"[ROLLFORWARD] price_data")
                     else:
                         self.log.warning(f"[ROLLFORWARD] No {cache_name} data found in preloader for {ts_to_check}")
-                else:
-                    self.log.warning(f"[ROLLFORWARD] Price preloader not available, falling back to DB")
-                    # 回退到原有的数据库获取方法
-                    self._fetch_factors(ts)
+                        # 回退到数据库获取
+                        self._fetch_factors_from_db_fallback(ts, factor, delay)
+                except Exception as e:
+                    self.log.warning(f"[ROLLFORWARD] Error getting {cache_name} from preloader: {e}, falling back to DB")
+                    # 回退到数据库获取
+                    self._fetch_factors_from_db_fallback(ts, factor, delay)
             else:
-                # 对于非价格因子，仍然使用原有的数据库获取方法
-                self.log.debug(f"[ROLLFORWARD] Non-price factor {factor['factor']}, using DB")
-                self._fetch_factors(ts)
+                self.log.warning(f"[ROLLFORWARD] Price preloader not available, falling back to DB")
+                # 回退到原有的数据库获取方法
+                self._fetch_factors_from_db_fallback(ts, factor, delay)
     
     def _send_pos_for_rollforward(self, new_pos, ts):
         """回滚模式的仓位发送 - 只记录日志，不实际发送"""
