@@ -18,8 +18,9 @@ import numpy as np
 
 
 # %%
-rt_path = 'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/rt/debug_data_20250605_003000.pkl'
-bt_path = 'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/bt/debug_data_20250605_003000.pkl'
+date_ts = '20250605_003000'
+rt_path = f'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/rt/debug_data/debug_data_{date_ts}.pkl'
+bt_path = f'D:/crypto/prod/alpha/portfolio_management/verify/roll_from_his_backtest/bt/debug_data/debug_data_{date_ts}.pkl'
 
 # %%
 with open(rt_path, 'rb') as f:
@@ -61,7 +62,7 @@ for bt_key, rt_key in mm_mapping.items():
         rt_series = rt_mm_t[rt_key]
         bt_series = pd.Series(bt_mm_t[bt_key], index=bt_symbols)
         diff = (rt_series - bt_series).abs()
-        print(f"mm_t[{bt_key}→{rt_key}] max diff: {diff.max():.6f}, mean diff: {diff.mean():.6f}")
+        print(f"mm_t[{bt_key}→{rt_key}] max diff: {diff.max():.10f}, mean diff: {diff.mean():.10f}")
 
 # %% Process and compare his_pft_t
 rt_his_pft_t = array_to_series_reindex(rt_data['his_pft_t'], rt_symbols, bt_symbols)
@@ -73,7 +74,8 @@ for bt_key, rt_key in pft_mapping.items():
         rt_series = rt_his_pft_t[rt_key]
         bt_series = pd.Series(bt_his_pft_t[bt_key], index=bt_symbols)
         diff = (rt_series - bt_series).abs()
-        print(f"his_pft_t[{bt_key}→{rt_key}] max diff: {diff.max():.6f}, mean diff: {diff.mean():.6f}")
+        # breakpoint()
+        print(f"his_pft_t[{bt_key}→{rt_key}] max diff: {diff.max():.10f}, mean diff: {diff.mean():.10f}")
 
 # %% Process and compare current_pos
 # if hasattr(rt_data['current_pos'], 'index'):
@@ -103,7 +105,7 @@ else:
 
 print("\n=== alpha comparison ===")
 diff = (rt_alpha - bt_alpha).abs()
-print(f"alpha max diff: {diff.max():.6f}, mean diff: {diff.mean():.6f}")
+print(f"alpha max diff: {diff.max():.10f}, mean diff: {diff.mean():.10f}")
 
 # %% Print top differences for each comparison
 print("\n=== Top 5 differences ===")

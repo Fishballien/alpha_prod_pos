@@ -323,6 +323,17 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             # 1. 计算上期profit（t-1到t的收益）
             pft_till_t, fee_till_t = self._calc_profit_t_1_till_t_validation(ts)
             
+            if pft_till_t is not None:
+                sp = self.params['sp']
+                interval = timedelta(seconds=parse_time_string(sp))
+                pre_t_1 = ts - interval
+                self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
+            if fee_till_t is not None:
+                sp = self.params['sp']
+                interval = timedelta(seconds=parse_time_string(sp))
+                pre_t_1 = ts - interval
+                self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
+            
             # 2. 从persist读取历史alpha
             raw_alpha = self._fetch_historical_alpha(ts)
             if raw_alpha is None:
@@ -379,16 +390,18 @@ class PosUpdaterBacktestValidator(PosUpdaterWithBacktest):
             self.cache_mgr.add_row('pos_his', new_pos, ts)
             
             # 11. 保存profit到cache供下次使用（关键添加！）
-            if pft_till_t is not None:
-                sp = self.params['sp']
-                interval = timedelta(seconds=parse_time_string(sp))
-                pre_t_1 = ts - interval
-                self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
-            if fee_till_t is not None:
-                sp = self.params['sp']
-                interval = timedelta(seconds=parse_time_string(sp))
-                pre_t_1 = ts - interval
-                self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
+# =============================================================================
+#             if pft_till_t is not None:
+#                 sp = self.params['sp']
+#                 interval = timedelta(seconds=parse_time_string(sp))
+#                 pre_t_1 = ts - interval
+#                 self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
+#             if fee_till_t is not None:
+#                 sp = self.params['sp']
+#                 interval = timedelta(seconds=parse_time_string(sp))
+#                 pre_t_1 = ts - interval
+#                 self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
+# =============================================================================
             
             return new_pos
         

@@ -275,6 +275,7 @@ class PosUpdater:
         try:
             self._fetch_factors(ts)
             pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
+            self._save_pnl_to_cache(ts, pft_till_t, fee_till_t)
             self._fetch_funding(ts)
             predict_value_matrix = self._fetch_predictions(ts)
             w0 = self._fetch_pre_pos()
@@ -297,7 +298,7 @@ class PosUpdater:
             # pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
             # self._report_new_pos(new_pos)
             period_pnl = self._record_n_repo_pos_diff_and_pnl(new_pos, w0, pft_till_t, fee_till_t)
-            self._save_to_cache(ts, new_pos, pft_till_t, fee_till_t, period_pnl)
+            self._save_to_cache(ts, new_pos, period_pnl)
             self._save_to_persist(ts, alpha, new_pos, pft_till_t, fee_till_t, period_pnl)
         except:
             self.log.exception('update error')
@@ -663,15 +664,13 @@ class PosUpdater:
                                 pos_diff_in_markdown, msg_type='info')
 
         return period_pnl
-        
-    def _save_to_cache(self, ts, new_pos, pft_till_t, fee_till_t, period_pnl):
+    
+    def _save_pnl_to_cache(self, ts, pft_till_t, fee_till_t):
         sp = self.params['sp']
 
         interval = timedelta(seconds=parse_time_string(sp))
         pre_t_1 = ts - interval
-        
-        if new_pos is not None:
-            self.cache_mgr.add_row('pos_his', new_pos, ts)
+
         if pft_till_t is not None:
             self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
         else:
@@ -680,6 +679,15 @@ class PosUpdater:
             self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
         else:
             self.log.warning(f'Failed to calc fee during {pre_t_1} - {ts}. Skip saving cache: fee.')
+        
+    def _save_to_cache(self, ts, new_pos, period_pnl):
+        sp = self.params['sp']
+
+        interval = timedelta(seconds=parse_time_string(sp))
+        pre_t_1 = ts - interval
+        
+        if new_pos is not None:
+            self.cache_mgr.add_row('pos_his', new_pos, ts)
         self.cache_mgr.add_row('period_pnl', period_pnl, pre_t_1)
         self.cache_mgr.save(ts)
         
