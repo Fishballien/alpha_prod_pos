@@ -789,13 +789,17 @@ class PosUpdaterWithBacktest(PosUpdater):
         self._init_backtest_params()
     
     def _attempt_backtest_initialization(self):
-        """尝试从回测初始化"""
+        """尝试从回测初始化（修改版本，添加价格数据预加载）"""
         try:
             self.log.info("Attempting backtest initialization...")
             
-            # 新增：预加载历史twap_profit数据到cache
+            # 1. 预加载历史价格数据（新增！）
+            self._preload_historical_price_data_for_rollforward()
+            
+            # 2. 预加载历史twap_profit数据到cache
             self._preload_historical_twap_profit()
             
+            # 3. 执行rollforward
             success = self._rollforward_from_backtest()
             if success:
                 self.backtest_initialization_completed = True
@@ -808,6 +812,89 @@ class PosUpdaterWithBacktest(PosUpdater):
             self.log.exception("Error during backtest initialization")
             self.ding.send_text(f"Error during backtest initialization: {str(e)}", msg_type='error')
     
+    def _preload_historical_price_data_for_rollforward(self):
+        """预加载历史价格数据供rollforward时的momentum和profit计算使用"""
+        try:
+            self.log.info("Preloading historical price data for rollforward...")
+            
+            # 获取rollforward起始时间
+            start_time = self._get_rollforward_start_time()
+            if start_time is None:
+                self.log.warning("Cannot determine start time for price data preloading")
+                return
+            
+            # 获取价格数据文件路径（从backtest_init参数中获取）
+            curr_price_path = self.backtest_init_params.get('curr_price_path')
+            twap_price_path = self.backtest_init_params.get('twap_price_path')
+            
+            if not curr_price_path or not twap_price_path:
+                self.log.error("curr_price_path and twap_price_path must be specified in backtest_init config")
+                return
+            
+            # 获取回看天数（可配置，默认10天）
+            price_lookback_days = self.backtest_init_params.get('price_lookback_days', 10)
+            preload_start = start_time - timedelta(days=price_lookback_days)
+            
+            self.log.info(f"Preloading price data from {preload_start} to {start_time} ({price_lookback_days} days lookback)")
+            
+            curr_price_loaded = 0
+            twap_price_loaded = 0
+            
+            # 加载curr_price数据
+            try:
+                self.log.info(f"Loading curr_price from: {curr_price_path}")
+                curr_price_data = pd.read_parquet(curr_price_path)
+                
+                # 过滤时间范围：preload_start 到 start_time（不包含start_time，因为start_time会从DB读取）
+                curr_price_filtered = curr_price_data.loc[preload_start:start_time]
+                if not curr_price_filtered.empty:
+                    # 排除start_time本身（start_time的数据将从DB实时读取）
+                    curr_price_filtered = curr_price_filtered.loc[curr_price_filtered.index < start_time]
+                
+                # 批量写入cache
+                for ts in curr_price_filtered.index:
+                    try:
+                        price_data = curr_price_filtered.loc[ts]
+                        self.cache_mgr.add_row('curr_price', price_data, ts)
+                        curr_price_loaded += 1
+                    except Exception:
+                        continue
+                        
+                self.log.success(f"Loaded {curr_price_loaded} curr_price records")
+                
+            except Exception as e:
+                self.log.error(f"Error loading curr_price data: {e}")
+            
+            # 加载twap_price数据
+            try:
+                self.log.info(f"Loading twap_price from: {twap_price_path}")
+                twap_price_data = pd.read_parquet(twap_price_path)
+                
+                # 过滤时间范围：preload_start 到 start_time（不包含start_time）
+                twap_price_filtered = twap_price_data.loc[preload_start:start_time]
+                if not twap_price_filtered.empty:
+                    # 排除start_time本身
+                    twap_price_filtered = twap_price_filtered.loc[twap_price_filtered.index < start_time]
+                
+                # 批量写入cache
+                for ts in twap_price_filtered.index:
+                    try:
+                        price_data = twap_price_filtered.loc[ts]
+                        self.cache_mgr.add_row('twap_price', price_data, ts)
+                        twap_price_loaded += 1
+                    except Exception:
+                        continue
+                        
+                self.log.success(f"Loaded {twap_price_loaded} twap_price records")
+                
+            except Exception as e:
+                self.log.error(f"Error loading twap_price data: {e}")
+            
+            self.log.success(f"Price data preloading completed: {curr_price_loaded} curr_price and {twap_price_loaded} twap_price records")
+            
+        except Exception as e:
+            self.log.exception(f"Error preloading historical price data for rollforward: {e}")
+            
     def _preload_historical_twap_profit(self):
         """预加载历史twap_profit数据到cache（新增功能1）"""
         try:
@@ -871,7 +958,7 @@ class PosUpdaterWithBacktest(PosUpdater):
                 
         except Exception as e:
             self.log.exception(f"Error preloading historical twap_profit: {e}")
-    
+            
     def _get_rollforward_start_time(self):
         """获取rollforward的起始时间（新增功能2支持）"""
         try:
