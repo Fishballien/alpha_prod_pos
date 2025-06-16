@@ -28,36 +28,73 @@ from utility.timeutils import get_date_based_on_timestamp
 # %%
 class PriceDataPreloader:
     """
-    价格数据预加载器
-    在初始化时批量读取指定时间范围内的currprice和twapprice数据
+    价格数据预加载器 - 参数化版本
+    支持基于factors配置灵活读取目标数据，而不是硬编码currprice和twapprice
     """
     
-    def __init__(self, persist_dir, start_time, lookback_days=30, log=None):
+    def __init__(self, persist_dir, start_time, factors_config, trading_symbols, lookback_days=30, log=None):
         """
         初始化价格数据预加载器
         
         Args:
             persist_dir: 持久化数据目录路径 (Path对象)
             start_time: 回测开始时间戳
+            factors_config: 因子配置列表，格式与PosUpdater中assist_factors_params['factors']相同
+            trading_symbols: 交易标的列表
             lookback_days: 向前加载的天数，默认30天
             log: 日志对象
         """
         self.persist_dir = Path(persist_dir)
         self.start_time = start_time
+        self.factors_config = factors_config
+        self.trading_symbols = trading_symbols
         self.lookback_days = lookback_days
         self.log = log
         
-        # 预加载的价格数据容器
-        self.currprice_data = pd.DataFrame()
-        self.twapprice_data = pd.DataFrame()
+        # 预加载的数据容器 - 按因子名称动态创建
+        self.loaded_data = {}
+        
+        # 构建因子到元组的映射
+        self._build_factor_mappings()
         
         # 执行预加载
-        self._preload_price_data()
+        self._preload_data()
+    
+    def _build_factor_mappings(self):
+        """构建因子配置映射"""
+        self.factor_tuples = {}
+        self.factor_cache_names = {}
+        
+        for factor_config in self.factors_config:
+            factor_name = factor_config['factor']
+            table_name = factor_config['table']
+            column_name = factor_config['column']
+            
+            # 构建因子元组 (table, column)
+            factor_tuple = (table_name, column_name)
+            self.factor_tuples[factor_name] = factor_tuple
+            
+            # 确定缓存名称 (与PosUpdater逻辑一致)
+            if factor_name.startswith('curr_price'):
+                cache_name = 'curr_price'
+            elif factor_name.startswith('twap') or 'twap' in factor_name.lower():
+                cache_name = 'twap_price'
+            else:
+                # 对于其他因子类型，使用因子名称作为缓存名
+                cache_name = factor_name
+            
+            self.factor_cache_names[factor_name] = cache_name
+            
+        if self.log:
+            self.log.info(f"Built factor mappings: {len(self.factor_tuples)} factors")
     
     def _get_date_range(self):
         """
         根据start_time和lookback_days计算需要加载的日期范围
         """
+        # 导入timeutils中的函数
+        from utility.timeutils import get_date_based_on_timestamp
+        
         start_date = get_date_based_on_timestamp(self.start_time)
         start_dt = pd.Timestamp(start_date)
         
@@ -71,9 +108,9 @@ class PriceDataPreloader:
         date_range = pd.date_range(begin_dt, end_dt, freq='D')
         return [dt.strftime('%Y%m%d') for dt in date_range]
     
-    def _load_from_h5_file(self, file_path, target_keys=['currprice', 'twapprice']):
+    def _load_from_h5_file(self, file_path, target_keys):
         """
-        从单个h5文件中加载指定的价格数据
+        从单个h5文件中加载指定的数据
         参考PersistenceManager的_load_from_h5_batch方法
         """
         if not file_path.exists():
@@ -89,7 +126,7 @@ class PriceDataPreloader:
                         data = store[key]
                         loaded_data[key] = data
                         if self.log:
-                            self.log.info(f'Loaded {key} from {file_path.name} with shape {data.shape}')
+                            self.log.debug(f'Loaded {key} from {file_path.name} with shape {data.shape}')
         except Exception as e:
             # 如果HDFStore失败，尝试用h5py读取
             try:
@@ -109,100 +146,104 @@ class PriceDataPreloader:
                             ]
                             loaded_data[key] = pd.DataFrame(data, index=index, columns=columns)
                             if self.log:
-                                self.log.info(f'Loaded {key} from {file_path.name} with shape {data.shape}')
+                                self.log.debug(f'Loaded {key} from {file_path.name} with shape {data.shape}')
             except Exception as e2:
                 if self.log:
                     self.log.warning(f'Failed to load from {file_path}: {e}, {e2}')
         
         return loaded_data
     
-    def _preload_price_data(self):
+    def _preload_data(self):
         """
-        批量预加载价格数据
+        批量预加载数据
         """
         date_list = self._get_date_range()
         
-        currprice_frames = []
-        twapprice_frames = []
+        # 为每个因子准备数据框列表
+        factor_frames = {factor_name: [] for factor_name in self.factor_tuples.keys()}
+        
+        # 构建需要从h5文件中读取的key列表
+        target_keys = []
+        for factor_tuple in self.factor_tuples.values():
+            # 将因子元组转换为h5文件中的key格式
+            # 假设存储格式为 (table, column, symbol) 的组合
+            for symbol in self.trading_symbols:
+                key = (*factor_tuple, symbol)
+                target_keys.append(key)
+        
+        # 去重
+        target_keys = list(set(target_keys))
         
         for date_str in date_list:
             file_path = self.persist_dir / f'{date_str}.h5'
-            loaded_data = self._load_from_h5_file(file_path)
+            loaded_data = self._load_from_h5_file(file_path, target_keys)
             
-            if 'currprice' in loaded_data:
-                currprice_frames.append(loaded_data['currprice'])
-            
-            if 'twapprice' in loaded_data:
-                twapprice_frames.append(loaded_data['twapprice'])
+            # 按因子组织数据
+            for factor_name, factor_tuple in self.factor_tuples.items():
+                # 收集该因子所有symbol的数据
+                factor_data_dict = {}
+                for symbol in self.trading_symbols:
+                    key = (*factor_tuple, symbol)
+                    if key in loaded_data:
+                        factor_data_dict[symbol] = loaded_data[key]
+                
+                # 如果有数据，构建DataFrame
+                if factor_data_dict:
+                    # 假设每个key对应的是时间序列数据，需要重新组织成 (timestamp, symbol) 的DataFrame
+                    # 这里可能需要根据实际的数据存储格式调整
+                    factor_df = pd.DataFrame(factor_data_dict)
+                    factor_frames[factor_name].append(factor_df)
         
         # 合并所有数据
-        if currprice_frames:
-            self.currprice_data = pd.concat(currprice_frames, axis=0).sort_index()
-            # 去重，保留最后一个值
-            self.currprice_data = self.currprice_data[~self.currprice_data.index.duplicated(keep='last')]
-            if self.log:
-                self.log.success(f'Preloaded currprice data: {self.currprice_data.shape}')
+        for factor_name, frames in factor_frames.items():
+            if frames:
+                combined_data = pd.concat(frames, axis=0).sort_index()
+                # 去重，保留最后一个值
+                combined_data = combined_data[~combined_data.index.duplicated(keep='last')]
+                
+                cache_name = self.factor_cache_names[factor_name]
+                self.loaded_data[cache_name] = combined_data
+                
+                if self.log:
+                    self.log.success(f'Preloaded {factor_name} -> {cache_name}: {combined_data.shape}')
+    
+    def get_data_at_time(self, cache_name, timestamp, symbols=None):
+        """
+        获取指定缓存名称和时间点的数据
         
-        if twapprice_frames:
-            self.twapprice_data = pd.concat(twapprice_frames, axis=0).sort_index()
-            # 去重，保留最后一个值
-            self.twapprice_data = self.twapprice_data[~self.twapprice_data.index.duplicated(keep='last')]
-            if self.log:
-                self.log.success(f'Preloaded twapprice data: {self.twapprice_data.shape}')
+        Args:
+            cache_name: 缓存名称 ('curr_price', 'twap_price', 等)
+            timestamp: 时间戳
+            symbols: 股票代码列表，如果为None则返回所有
+        
+        Returns:
+            pd.Series or pd.DataFrame
+        """
+        if cache_name not in self.loaded_data or self.loaded_data[cache_name].empty:
+            return pd.Series(dtype=float) if symbols is None else pd.Series(index=symbols, dtype=float)
+        
+        data = self.loaded_data[cache_name]
+        
+        # 找到小于等于timestamp的最近数据
+        valid_data = data[data.index <= timestamp]
+        if valid_data.empty:
+            return pd.Series(dtype=float) if symbols is None else pd.Series(index=symbols, dtype=float)
+        
+        latest_data = valid_data.iloc[-1]
+        
+        if symbols is None:
+            return latest_data
+        else:
+            # 只返回指定symbols的数据
+            return latest_data.reindex(symbols)
     
     def get_currprice_at_time(self, timestamp, symbols=None):
-        """
-        获取指定时间点的currprice数据
-        
-        Args:
-            timestamp: 时间戳
-            symbols: 股票代码列表，如果为None则返回所有
-        
-        Returns:
-            pd.Series or pd.DataFrame
-        """
-        if self.currprice_data.empty:
-            return pd.Series(dtype=float) if symbols is None else pd.Series(index=symbols, dtype=float)
-        
-        # 找到小于等于timestamp的最近数据
-        valid_data = self.currprice_data[self.currprice_data.index <= timestamp]
-        if valid_data.empty:
-            return pd.Series(dtype=float) if symbols is None else pd.Series(index=symbols, dtype=float)
-        
-        latest_data = valid_data.iloc[-1]
-        
-        if symbols is None:
-            return latest_data
-        else:
-            # 只返回指定symbols的数据
-            return latest_data.reindex(symbols)
+        """保持向后兼容的方法"""
+        return self.get_data_at_time('curr_price', timestamp, symbols)
     
     def get_twapprice_at_time(self, timestamp, symbols=None):
-        """
-        获取指定时间点的twapprice数据
-        
-        Args:
-            timestamp: 时间戳
-            symbols: 股票代码列表，如果为None则返回所有
-        
-        Returns:
-            pd.Series or pd.DataFrame
-        """
-        if self.twapprice_data.empty:
-            return pd.Series(dtype=float) if symbols is None else pd.Series(index=symbols, dtype=float)
-        
-        # 找到小于等于timestamp的最近数据
-        valid_data = self.twapprice_data[self.twapprice_data.index <= timestamp]
-        if valid_data.empty:
-            return pd.Series(dtype=float) if symbols is None else pd.Series(index=symbols, dtype=float)
-        
-        latest_data = valid_data.iloc[-1]
-        
-        if symbols is None:
-            return latest_data
-        else:
-            # 只返回指定symbols的数据
-            return latest_data.reindex(symbols)
+        """保持向后兼容的方法"""
+        return self.get_data_at_time('twap_price', timestamp, symbols)
         
 
 if __name__ == '__main__':
@@ -252,32 +293,6 @@ if __name__ == '__main__':
         print(f"✗ 初始化失败: {e}")
         preloader = None
     print()
-    
-    # 如果初始化成功，尝试加载数据
-    if preloader is not None:
-        print("尝试加载数据...")
-        try:
-            data = preloader.load_data()  # 假设有这个方法
-            print("✓ 数据加载成功")
-            
-            if hasattr(data, 'shape'):
-                print(f"  数据形状: {data.shape}")
-            if hasattr(data, 'columns'):
-                print(f"  列名: {list(data.columns)[:5]}...")  # 只显示前5列
-            if hasattr(data, 'index'):
-                print(f"  索引类型: {type(data.index)}")
-                if len(data.index) > 0:
-                    print(f"  时间范围: {data.index[0]} 到 {data.index[-1]}")
-            
-            # 显示前几行数据
-            if hasattr(data, 'head'):
-                print("  前几行数据:")
-                print(data.head(3))
-                
-        except Exception as e:
-            print(f"✗ 数据加载失败: {e}")
-            data = None
-        print()
     
     # 计算预期的时间范围
     print("时间范围计算:")
