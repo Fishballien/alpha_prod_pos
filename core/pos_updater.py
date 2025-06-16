@@ -847,10 +847,7 @@ class PosUpdaterWithBacktest(PosUpdater):
                 
                 # 过滤时间范围：preload_start 到 start_time（不包含start_time，因为start_time会从DB读取）
                 curr_price_filtered = curr_price_data.loc[preload_start:start_time]
-                if not curr_price_filtered.empty:
-                    # 排除start_time本身（start_time的数据将从DB实时读取）
-                    curr_price_filtered = curr_price_filtered.loc[curr_price_filtered.index < start_time]
-                
+
                 # 批量写入cache
                 for ts in curr_price_filtered.index:
                     try:
@@ -872,10 +869,7 @@ class PosUpdaterWithBacktest(PosUpdater):
                 
                 # 过滤时间范围：preload_start 到 start_time（不包含start_time）
                 twap_price_filtered = twap_price_data.loc[preload_start:start_time]
-                if not twap_price_filtered.empty:
-                    # 排除start_time本身
-                    twap_price_filtered = twap_price_filtered.loc[twap_price_filtered.index < start_time]
-                
+
                 # 批量写入cache
                 for ts in twap_price_filtered.index:
                     try:
@@ -1132,124 +1126,122 @@ class PosUpdaterWithBacktest(PosUpdater):
         self.log.success(f"Rollforward completed: {successful_updates}/{len(timestamps)} successful updates, final position at {latest_ts}")
     
     def _rollforward_update_once(self, ts, current_pos):
-        """历史模式的单次更新"""
+        """历史模式的单次更新 - 与update_once步骤完全一致"""
         try:
-            # 1. 从persist读取历史数据
-            alpha = self._fetch_historical_alpha(ts)
-            if alpha is None:
-                return current_pos
+            # 1. 获取因子数据（回滚模式：从数据库读取）
+            self._fetch_factors(ts)
             
-            # 2. 重建必要的cache数据（从persist）
-            self._rebuild_cache_for_timestamp(ts)
+            # 2. 计算t-1至t的收益和费用
+            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
             
-            # 3. 获取funding过滤
-            allow_to_trade_by_funding = self._filter_by_funding_historical(ts)
+            # 3. 保存pnl到cache
+            self._save_pnl_to_cache(ts, pft_till_t, fee_till_t)
             
-            # 4. 计算momentum和历史收益
-            mm_t = self._get_momentum_at_t(ts, allow_to_trade_by_funding)
-            his_pft_t = self._get_his_profit_at_t(ts, allow_to_trade_by_funding)
+            # 4. 获取funding数据（回滚模式：从数据库读取）
+            self._fetch_funding(ts)
             
-            # 5. 组合优化
-            w1 = self._po_on_tradable(current_pos, alpha, mm_t, his_pft_t, allow_to_trade_by_funding)
+            # 5. 获取预测值（回滚模式：从persist读取历史alpha）
+            predict_value_matrix = self._fetch_predictions(ts)
             
-            # 6. 更新到全集
-            new_pos = self._update_positions_on_universal_set(current_pos, w1)
+            # 6. 获取前期仓位（回滚模式：使用传入的current_pos）
+            w0 = current_pos
+            if w0 is None:
+                return None
+                
+            # 7. 组合优化或保持原仓位
+            if predict_value_matrix is not None:
+                # 7a. 获取alpha
+                alpha = self._get_alpha(predict_value_matrix)
+                
+                # 7b. 根据funding过滤可交易标的
+                allow_to_trade_by_funding = self._filter_by_funding(ts)
+                
+                # 7c. 计算momentum
+                mm_t = self._get_momentum_at_t(ts, allow_to_trade_by_funding)
+                
+                # 7d. 计算历史收益
+                his_pft_t = self._get_his_profit_at_t(ts, allow_to_trade_by_funding)
+                
+                # 7e. 组合优化
+                w1 = self._po_on_tradable(w0, alpha, mm_t, his_pft_t, allow_to_trade_by_funding)
+            else:
+                w1 = w0
+                alpha = None
+                self._repo_model_error()
+                
+            # 8. 更新全集仓位
+            new_pos = self._update_positions_on_universal_set(w0, w1)
             
-            # 7. 添加新仓位到cache（用于后续计算momentum和pft）
-            self.cache_mgr.add_row('pos_his', new_pos, ts)
+            # 9. 发送仓位（回滚模式：跳过实际发送，只记录日志）
+            self._send_pos_for_rollforward(new_pos, ts)
             
-            # 8. 计算并保存当期的twap_profit到persist（新增：只保存新计算的）
-            self._calc_and_save_current_twap_profit(ts)
+            # 10. 发送到数据库（回滚模式：跳过实际写入）
+            # self._send_pos_to_db(new_pos)  # 回滚时不写数据库
             
-            # 注意：历史滚动不写入数据库，只更新内存状态
+            # 11. 记录仓位变化和pnl
+            period_pnl = self._record_n_repo_pos_diff_and_pnl_for_rollforward(new_pos, w0, pft_till_t, fee_till_t)
+            
+            # 12. 保存到cache
+            self._save_to_cache(ts, new_pos, period_pnl)
+            
+            # 13. 保存到persist
+            # self._save_to_persist(ts, alpha, new_pos, pft_till_t, fee_till_t, period_pnl)
+            
             return new_pos
             
         except Exception as e:
-            self.log.warning(f"Error in rollforward_update_once at {ts}: {e}")
+            self.log.exception(f'rollforward update error at {ts}')
+            error_msg = traceback.format_exc()
+            self.ding.send_markdown(f'ROLLFORWARD UPDATE ERROR at {ts}', error_msg, msg_type='error')
             return current_pos
     
-    def _calc_and_save_current_twap_profit(self, ts):
-        """计算并保存当前时刻的twap_profit到persist（新增方法）"""
+    def _send_pos_for_rollforward(self, new_pos, ts):
+        """回滚模式的仓位发送 - 只记录日志，不实际发送"""
         try:
-            # 计算t-1至t的收益
-            pft_till_t, fee_till_t = self._calc_profit_t_1_till_t(ts)
-            
-            if pft_till_t is not None:
-                sp = self.params['sp']
-                interval = timedelta(seconds=parse_time_string(sp))
-                pre_t_1 = ts - interval
-                
-                # 添加到cache（用于后续hispft计算）
-                self.cache_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
-                
-                # 保存到persist（只保存新计算的数据点）
-                self.persist_mgr.add_row('twap_profit', pft_till_t, pre_t_1)
-                
-                self.log.debug(f"Saved twap_profit for {pre_t_1}")
-            
-            if fee_till_t is not None:
-                sp = self.params['sp']
-                interval = timedelta(seconds=parse_time_string(sp))
-                pre_t_1 = ts - interval
-                
-                # 添加到cache和persist
-                self.cache_mgr.add_row('fee', fee_till_t, pre_t_1)
-                self.persist_mgr.add_row('fee', fee_till_t, pre_t_1)
-                
+            self.log.debug(f"[ROLLFORWARD] Position updated at {ts}: {len(new_pos)} symbols")
+            # 回滚时不实际发送到ZMQ和Thunder，只记录
         except Exception as e:
-            self.log.debug(f"Error calculating/saving twap_profit at {ts}: {e}")
+            self.log.warning(f"Error in rollforward position logging: {e}")
     
+    def _record_n_repo_pos_diff_and_pnl_for_rollforward(self, new_pos, w0, pft_till_t, fee_till_t):
+        """回滚模式的仓位变化和pnl记录 - 计算但不发送报告"""
+        try:
+            pos_change_to_repo = self.params['pos_change_to_repo']
+    
+            ## pos diff
+            reindexed_w0 = w0.reindex(new_pos.index, fill_value=0)
+            pos_diff = new_pos - reindexed_w0
+            pos_diff_filtered = filter_series(pos_diff, min_abs_value=pos_change_to_repo)
+            
+            ## hsr
+            hsr = pos_diff.abs().sum() / 2
+            
+            ## agg pnl & fee
+            pnl_occurred = np.sum(pft_till_t) if pft_till_t is not None else np.nan
+            fee_occurred = np.sum(fee_till_t) if fee_till_t is not None else 0
+            
+            ## period net pnl
+            period_pnl = pd.Series({
+                'pnl': pnl_occurred, 
+                'fee': fee_occurred,
+                'net_pnl': pnl_occurred - fee_occurred,
+            })
+            
+            # 回滚时只记录到日志，不发送钉钉
+            self.log.debug(f"[ROLLFORWARD] HSR: {hsr:.2%}, Net PnL: {period_pnl['net_pnl']:.2%}")
+            
+            return period_pnl
+            
+        except Exception as e:
+            self.log.warning(f"Error recording rollforward pnl: {e}")
+            return pd.Series({'pnl': np.nan, 'fee': 0, 'net_pnl': np.nan})
+
     def _fetch_historical_alpha(self, ts):
         """从persist获取历史alpha"""
         try:
             return self.persist_mgr.get_row('alpha', ts)
         except Exception as e:
             return None
-    
-    def _rebuild_cache_for_timestamp(self, ts):
-        """为特定时间戳重建cache数据"""
-        # 从persist读取必要的历史数据到cache
-        data_to_rebuild = ['curr_price', 'twap_price', 'est_funding_rate']
-        
-        for data_name in data_to_rebuild:
-            try:
-                data = self.persist_mgr.get_row(data_name, ts)
-                if data is not None:
-                    self.cache_mgr.add_row(data_name, data, ts)
-            except Exception as e:
-                # 某些数据可能不存在，继续
-                continue
-    
-    def _filter_by_funding_historical(self, ts):
-        """历史模式的funding过滤"""
-        funding_limit_pr = self.params.get('funding_limit')
-        if funding_limit_pr is None:
-            return self.trading_symbols
-        
-        try:
-            est_funding_rate = self.cache_mgr['est_funding_rate']
-            if ts not in est_funding_rate.index:
-                return self.trading_symbols
-                
-            funding_abs_limit = funding_limit_pr['funding_abs_limit']
-            funding_cooldown = funding_limit_pr.get('funding_cooldown')
-            
-            funding_invalid = est_funding_rate.abs() > funding_abs_limit
-            
-            if funding_cooldown is not None:
-                rolling_below_threshold = funding_invalid.rolling(window=funding_cooldown, min_periods=1).mean()
-                final_mask = rolling_below_threshold != 0
-            else:
-                final_mask = funding_invalid
-                
-            latest_final_mask = final_mask.loc[ts].reindex(index=self.trading_symbols).fillna(False)
-            allow_to_trade_by_funding = latest_final_mask[~latest_final_mask].index.tolist()
-            
-            return allow_to_trade_by_funding
-            
-        except Exception as e:
-            self.log.warning(f"Error in historical funding filter: {e}")
-            return self.trading_symbols
     
     def _fetch_pre_pos(self):
         """重写获取前期仓位方法，优先使用回测初始化的结果"""
