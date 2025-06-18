@@ -126,9 +126,11 @@ class PosUpdater:
         max_wgt = optimizer_params.get('max_wgt')
         momentum_limits = optimizer_params['momentum_limits']
         pf_limits = optimizer_params['pf_limits']
+        max_single_turnover = optimizer_params.get('max_single_turnover')
         
         self.opt_func = partial(future_optimal_weight_lp_cvxpy, max_multi=max_multi, max_wgt=max_wgt, 
-                                momentum_limits=momentum_limits, pf_limits=pf_limits)
+                                momentum_limits=momentum_limits, pf_limits=pf_limits, 
+                                max_single_turnover=max_single_turnover)
     
     def _init_ding_reporter(self):
         ding_config = self.params['ding']
@@ -758,6 +760,7 @@ class PosUpdaterWithBacktest(PosUpdater):
         
         # 调用父类初始化
         super().__init__(stg_name)
+        self.cache_mgr.clear_cache_data()
         
         # 初始化价格数据预加载器
         self.price_preloader = None
@@ -796,27 +799,30 @@ class PosUpdaterWithBacktest(PosUpdater):
     
     def _attempt_backtest_initialization(self):
         """尝试从回测初始化（使用价格数据预加载器优化）"""
-        try:
-            self.log.info("Attempting backtest initialization...")
-            
-            # 1. 初始化价格数据预加载器（新增！）
-            self._initialize_price_preloader()
-            
-            # 2. 预加载历史twap_profit数据到cache
-            self._preload_historical_twap_profit()
-            
-            # 3. 执行rollforward
-            success = self._rollforward_from_backtest()
-            if success:
-                self.backtest_initialization_completed = True
-                self.log.success("Successfully initialized from backtest")
-                self.ding.send_text("Successfully initialized from backtest", msg_type='success')
-            else:
-                self.log.warning("Failed to initialize from backtest, will use DB fallback")
-                self.ding.send_text("Failed to initialize from backtest, using DB fallback", msg_type='warning')
-        except Exception as e:
-            self.log.exception("Error during backtest initialization")
-            self.ding.send_text(f"Error during backtest initialization: {str(e)}", msg_type='error')
+        # try:
+        self.log.info("Attempting backtest initialization...")
+        
+        # 1. 初始化价格数据预加载器（新增！）
+        self._initialize_price_preloader()
+        self._preload_price_data_to_cache()
+        
+        # 2. 预加载历史twap_profit数据到cache
+        self._preload_historical_twap_profit()
+        
+        # breakpoint()
+        
+        # 3. 执行rollforward
+        success = self._rollforward_from_backtest()
+        if success:
+            self.backtest_initialization_completed = True
+            self.log.success("Successfully initialized from backtest")
+            self.ding.send_text("Successfully initialized from backtest", msg_type='success')
+        else:
+            self.log.warning("Failed to initialize from backtest, will use DB fallback")
+            self.ding.send_text("Failed to initialize from backtest, using DB fallback", msg_type='warning')
+        # except Exception as e:
+        #     self.log.exception("Error during backtest initialization")
+        #     self.ding.send_text(f"Error during backtest initialization: {str(e)}", msg_type='error')
     
     def _initialize_price_preloader(self):
         """初始化价格数据预加载器 - 使用参数化配置"""
@@ -855,6 +861,56 @@ class PosUpdaterWithBacktest(PosUpdater):
         except Exception as e:
             self.log.exception(f"Error initializing price preloader: {e}")
             self.price_preloader = None
+            
+    def _preload_price_data_to_cache(self):
+        """将预加载器中的价格数据存入cache（新增功能）"""
+        try:
+            if self.price_preloader is None:
+                self.log.warning("Price preloader not available, skipping cache preloading")
+                return
+            
+            self.log.info("Preloading price data from preloader to cache...")
+            
+            # 获取rollforward起始时间
+            start_time = self._get_rollforward_start_time()
+            if start_time is None:
+                self.log.warning("Cannot determine start time for cache preloading")
+                return
+            
+            # 遍历预加载器中的所有缓存数据
+            loaded_count = 0
+            for cache_name, price_data in self.price_preloader.loaded_data.items():
+                if price_data.empty:
+                    self.log.warning(f"No data found for cache {cache_name}")
+                    continue
+                
+                # 过滤到start_time之前的数据（不包含start_time）
+                historical_price_data = price_data[price_data.index <= start_time]
+                
+                if historical_price_data.empty:
+                    self.log.warning(f"No historical data before {start_time} for cache {cache_name}")
+                    continue
+                
+                # 批量写入cache - 逐行添加
+                cache_loaded_count = 0
+                for timestamp in historical_price_data.index:
+                    try:
+                        row_data = historical_price_data.loc[timestamp]
+                        # 确保数据符合trading_symbols的顺序
+                        aligned_data = row_data.reindex(self.trading_symbols)
+                        self.cache_mgr.add_row(cache_name, aligned_data, timestamp)
+                        cache_loaded_count += 1
+                    except Exception as e:
+                        self.log.debug(f"Error loading {cache_name} data at {timestamp}: {e}")
+                        continue
+                
+                loaded_count += cache_loaded_count
+                self.log.success(f"Preloaded {cache_loaded_count} {cache_name} records to cache")
+            
+            self.log.success(f"Total preloaded {loaded_count} price records to cache from preloader")
+            
+        except Exception as e:
+            self.log.exception(f"Error preloading price data to cache: {e}")
     
     def _preload_historical_twap_profit(self):
         """预加载历史twap_profit数据到cache"""
@@ -1063,6 +1119,7 @@ class PosUpdaterWithBacktest(PosUpdater):
         """执行滚动更新"""
         # 初始化当前仓位为指定起始时间的回测仓位
         current_pos = backtest_positions.loc[start_ts]
+        self.cache_mgr.add_row('pos_his', current_pos, start_ts)
         self.log.info(f"Starting rollforward from {len(timestamps)} timestamps, initial position at {start_ts}")
         
         # 将起始仓位添加到cache作为起始点
@@ -1190,7 +1247,7 @@ class PosUpdaterWithBacktest(PosUpdater):
                     if not price_data.empty:
                         self.cache_mgr.add_row(cache_name, price_data, ts_to_check)
                         self.log.debug(f"[ROLLFORWARD] Loaded {cache_name} from preloader at {ts_to_check}")
-                        self.log.debug(f"[ROLLFORWARD] price_data")
+                        self.log.debug(f"[ROLLFORWARD] {price_data}")
                     else:
                         self.log.warning(f"[ROLLFORWARD] No {cache_name} data found in preloader for {ts_to_check}")
                         # 回退到数据库获取

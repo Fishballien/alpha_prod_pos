@@ -96,6 +96,28 @@ class CacheManager(ParquetManager):
     
     def __setitem__(self, cache_name, data):
         self.cache[cache_name] = data
+        
+    def clear_cache_data(self):
+        """清空所有缓存数据，但保留原有的键"""
+        for cache_name in self.cache_list:
+            with self.locks[cache_name]:
+                # 保留键但清空DataFrame数据
+                self.cache[cache_name] = pd.DataFrame()
+        
+        if self.log:
+            self.log.success(f'✅ Cache data cleared for keys: {self.cache_list}')
+    
+    def clear_single_cache(self, cache_name):
+        """清空指定缓存的数据，但保留键"""
+        if cache_name in self.cache_list:
+            with self.locks[cache_name]:
+                self.cache[cache_name] = pd.DataFrame()
+            
+            if self.log:
+                self.log.success(f'✅ Cache data cleared for key: {cache_name}')
+        else:
+            if self.log:
+                self.log.warning(f'⚠ Cache key not found: {cache_name}. Available keys: {self.cache_list}')
 
 
 class PersistManager(ParquetManager):

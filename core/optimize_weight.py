@@ -19,7 +19,8 @@ import pandas as pd
 
 # %% simple
 def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh, 
-                                   max_multi=1, max_wgt=None, momentum_limits={}, pf_limits={}):
+                                   max_multi=1, max_wgt=None, momentum_limits={}, pf_limits={},
+                                   max_single_turnover=None):
     # 过滤和调整输入数据
     w0 = w0 - np.mean(w0)
     w0 = w0 / np.sum(np.abs(w0)) if np.sum(np.abs(w0)) != 0 else w0
@@ -44,6 +45,10 @@ def future_optimal_weight_lp_cvxpy(alpha, w0, mm_t, his_pft_t, to_rate_thresh,
     
     # 换手率控制
     constraints.append(cp.norm(w - w0, 1) <= to_rate_thresh * 2)
+    
+    # 单币种换手率约束 - 新增（向量化版本）
+    if max_single_turnover is not None:
+        constraints.append(cp.abs(w - w0) <= max_single_turnover)
     
     # 单个资产权重控制
     if max_wgt is None:
